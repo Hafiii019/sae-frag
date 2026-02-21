@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+env/
+sae_frag/
+
+# Dataset
+data/
+*.zip
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
