@@ -9,11 +9,13 @@ class ResNet101Backbone(nn.Module):
 
         resnet = models.resnet101(pretrained=pretrained)
 
-        # first layers
-        self.conv1 = resnet.conv1
-        self.bn1 = resnet.bn1
-        self.relu = resnet.relu
-        self.maxpool = resnet.maxpool
+        # first layers as layer0
+        self.layer0 = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool
+        )
 
         # ResNet stages
         self.layer1 = resnet.layer1   # C2
@@ -23,10 +25,7 @@ class ResNet101Backbone(nn.Module):
 
     def forward(self, x):
 
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
+        x = self.layer0(x)
 
         c2 = self.layer1(x)
         c3 = self.layer2(c2)

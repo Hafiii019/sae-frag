@@ -7,6 +7,7 @@ import numpy as np
 
 from data.dataset import IUXrayMultiViewDataset
 from models.multiview_backbone import MultiViewBackbone
+from models.alignment import CrossModalAlignment
 from models.projection import ProjectionHead
 from classification.sae_image_classifier import SAEImageClassifier
 from rag.hybrid_generator import HybridReportGenerator
@@ -31,7 +32,7 @@ with open("rag/train_reports.pkl", "rb") as f:
     train_metadata = pickle.load(f)
 
 # =====================================================
-# LOAD STAGE-1 BACKBONE + PROJECTION (FROZEN)
+# LOAD STAGE-1 BACKBONE + ALIGNMENT + PROJECTION (FROZEN)
 # =====================================================
 
 checkpoint = torch.load("checkpoints/best_stage1.pth", map_location=device)
@@ -40,6 +41,14 @@ visual_encoder = MultiViewBackbone().to(device)
 visual_encoder.load_state_dict(checkpoint["visual_model"])
 visual_encoder.eval()
 for p in visual_encoder.parameters():
+    p.requires_grad = False
+
+# CrossModalAlignment: image regions attend to retrieved report tokens
+# Produces region-aligned features (B, 49, 256) shaped by report context
+alignment = CrossModalAlignment().to(device)
+alignment.load_state_dict(checkpoint["alignment"])
+alignment.eval()
+for p in alignment.parameters():
     p.requires_grad = False
 
 proj_img = ProjectionHead().to(device)
@@ -66,10 +75,9 @@ for p in image_classifier.parameters():
 
 generator = HybridReportGenerator().to(device)
 
-# LOWER LR FOR STABILITY
 optimizer = torch.optim.AdamW(generator.parameters(), lr=1e-5)
 
-print("🚀 Stable Hybrid Training Started")
+print("Starting Aligned Hybrid Training...")
 
 # =====================================================
 # TRAIN LOOP
@@ -86,66 +94,75 @@ for epoch in range(8):
 
         images = images.to(device)
 
-        # ---------------------------
-        # 1️⃣ Region Features
-        # ---------------------------
         with torch.no_grad():
-            feats = visual_encoder(images)
-            region_features = feats.flatten(2).transpose(1, 2)
 
-        # ---------------------------
-        # 2️⃣ Image Entities
-        # ---------------------------
-        with torch.no_grad():
-            img_logits = image_classifier(images)
-            img_entities = (torch.sigmoid(img_logits) > 0.5).float()
+            # ------------------------------------------
+            # 1. Visual backbone: (B, 256, 7, 7)
+            # ------------------------------------------
+            visual_features = visual_encoder(images)
 
-        # ---------------------------
-        # 3️⃣ FAISS Retrieval
-        # ---------------------------
-        with torch.no_grad():
-            global_feat = feats.flatten(2).mean(dim=2)
+            # ------------------------------------------
+            # 2. FAISS retrieval using projected embedding
+            # ------------------------------------------
+            global_feat = visual_features.flatten(2).mean(dim=2)
             img_emb = proj_img(global_feat)
-
             img_np = img_emb.cpu().numpy().astype("float32")
             D, I = index.search(img_np, k=1)
 
-        retrieved_reports = []
-        rep_entities_batch = []
+            retrieved_reports = []
+            rep_entities_batch = []
 
-        for b in range(images.size(0)):
-            idx = I[b][0]
-            retrieved_reports.append(train_metadata[idx]["report"])
-            rep_entities_batch.append(train_metadata[idx]["entity_vector"])
+            for b in range(images.size(0)):
+                idx = I[b][0]
+                retrieved_reports.append(train_metadata[idx]["report"])
+                rep_entities_batch.append(train_metadata[idx]["entity_vector"])
 
-        rep_entities_batch = torch.cat(rep_entities_batch).to(device)
+            rep_entities_batch = torch.cat(rep_entities_batch).to(device)
+
+            # ------------------------------------------
+            # 3. Region-Aligned Features
+            #    Cross-attention: image regions (Q) attend
+            #    to retrieved report tokens (K, V) via
+            #    ClinicalBERT embeddings → (B, 49, 256)
+            # ------------------------------------------
+            aligned_features, _, _ = alignment(visual_features, retrieved_reports)
+
+            # ------------------------------------------
+            # 4. Image entity predictions (14 pathologies)
+            # ------------------------------------------
+            img_logits = image_classifier(images)
+            img_entities = (torch.sigmoid(img_logits) > 0.5).float()
+
+        # ------------------------------------------
+        # 5. Fact verification: keep only entities
+        #    confirmed by BOTH image AND retrieved report
+        # ------------------------------------------
         verified_entities = img_entities * rep_entities_batch
 
         prompts = [
-            "Generate a detailed radiology report using region features and verified clinical findings."
+            "Generate a detailed radiology report based on the chest X-ray regions, verified clinical findings, and retrieved context."
             for _ in range(images.size(0))
         ]
 
-        # ---------------------------
-        # 4️⃣ Forward Pass
-        # ---------------------------
+        # ------------------------------------------
+        # 6. Generator forward pass
+        #    aligned_features  → visual tokens (region-aligned)
+        #    verified_entities → fact-grounded entity tokens
+        #    retrieved_reports → retrieved context embeddings
+        #    prompts           → task instruction tokens
+        #    reports           → target for teacher-forcing
+        # ------------------------------------------
         loss = generator(
-            region_features=region_features,
+            region_features=aligned_features,
             entity_vector=verified_entities,
             retrieved_texts=retrieved_reports,
             prompt_texts=prompts,
             target_texts=reports
         )
 
-        # ---------------------------
-        # 5️⃣ Backprop (Stable)
-        # ---------------------------
         optimizer.zero_grad()
         loss.backward()
-
-        # VERY IMPORTANT
         torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
-
         optimizer.step()
 
         total_loss += loss.item()
@@ -156,4 +173,4 @@ for epoch in range(8):
 
     torch.save(generator.state_dict(), "rag/hybrid_generator.pth")
 
-print("✅ Hybrid Training Complete")
+print("Hybrid Training Complete")

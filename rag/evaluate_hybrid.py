@@ -11,6 +11,8 @@ import nltk
 from torch.utils.data import DataLoader
 from data.dataset import IUXrayMultiViewDataset
 from models.multiview_backbone import MultiViewBackbone
+from models.alignment import CrossModalAlignment
+from models.projection import ProjectionHead
 from classification.sae_image_classifier import SAEImageClassifier
 from classification.report_labeler import ReportClassifier
 from rag.hybrid_generator import HybridReportGenerator
@@ -35,12 +37,23 @@ with open("rag/train_reports.pkl", "rb") as f:
     train_metadata = pickle.load(f)
 
 # ------------------------------------------------
-# LOAD MODELS
+# LOAD STAGE-1 MODELS (FROZEN)
 # ------------------------------------------------
-visual_encoder = MultiViewBackbone().to(device)
 checkpoint = torch.load("checkpoints/best_stage1.pth", map_location=device)
+
+visual_encoder = MultiViewBackbone().to(device)
 visual_encoder.load_state_dict(checkpoint["visual_model"])
 visual_encoder.eval()
+
+# CrossModalAlignment: image regions (Q) attend to retrieved report tokens (K,V)
+# Produces region-aligned features (B, 49, 256) shaped by retrieved report context
+alignment = CrossModalAlignment().to(device)
+alignment.load_state_dict(checkpoint["alignment"])
+alignment.eval()
+
+proj_img = ProjectionHead().to(device)
+proj_img.load_state_dict(checkpoint["proj_img"])
+proj_img.eval()
 
 image_classifier = SAEImageClassifier().to(device)
 image_classifier.load_state_dict(
@@ -70,7 +83,7 @@ bleu1, bleu2, bleu3, bleu4 = [], [], [], []
 meteor_scores = []
 rouge_l_scores = []
 
-print("Evaluating Correct Hybrid Pipeline...")
+print("Evaluating Aligned Hybrid Pipeline...")
 
 # ------------------------------------------------
 # EVALUATION LOOP
@@ -82,33 +95,44 @@ with torch.no_grad():
         images = images.to(device)
         reference = reports[0]
 
-        # 1️⃣ Region features
-        feats = visual_encoder(images)
-        region_features = feats.flatten(2).transpose(1, 2)
+        # 1. Visual backbone features: (B, 256, 7, 7)
+        visual_features = visual_encoder(images)
 
-        # 2️⃣ Image entities
+        # 2. FAISS retrieval using projected global embedding
+        global_feat = visual_features.flatten(2).mean(dim=2)
+        img_emb = proj_img(global_feat)
+        img_np = img_emb.cpu().numpy().astype("float32")
+        D, I = index.search(img_np, k=1)
+
+        retrieved_report = train_metadata[I[0][0]]["report"]
+        rep_entities = train_metadata[I[0][0]]["entity_vector"].to(device)
+
+        # 3. Region-aligned features
+        #    image regions attend to retrieved report tokens via ClinicalBERT
+        #    → regions are guided by what the retrieved report discusses
+        aligned_features, _, _ = alignment(visual_features, [retrieved_report])
+
+        # 4. Image entity predictions (14 pathologies)
         img_logits = image_classifier(images)
         img_entities = (torch.sigmoid(img_logits) > 0.5).float()
 
-        # 3️⃣ Retrieve top-1 report
-        global_feat = feats.flatten(2).mean(dim=2)
-        global_np = global_feat.cpu().numpy().astype("float32")
-        D, I = index.search(global_np, k=1)
-
-        retrieved_report = train_metadata[I[0][0]]["report"]
-
-        # 4️⃣ Retrieved entities
-        rep_logits = report_classifier([retrieved_report])
-        rep_entities = (torch.sigmoid(rep_logits) > 0.5).float()
-
-        # 5️⃣ Verified intersection
+        # 5. Fact verification: intersection of image and retrieved-report entities
+        #    only keep findings confirmed by BOTH the image classifier
+        #    AND the retrieved similar report
         verified_entities = img_entities * rep_entities
 
-        prompt = ["Generate a detailed radiology report based on the image, verified findings, and retrieved context."]
+        prompt = [
+            "Generate a detailed radiology report based on the chest X-ray regions, "
+            "verified clinical findings, and retrieved context."
+        ]
 
-        # 6️⃣ Generate
+        # 6. Generate report
+        #    aligned_features  → region-aligned visual tokens
+        #    verified_entities → fact-grounded entity tokens
+        #    retrieved_report  → retrieved context text tokens
+        #    prompt            → task instruction tokens
         generated = generator(
-            region_features=region_features,
+            region_features=aligned_features,
             entity_vector=verified_entities,
             retrieved_texts=[retrieved_report],
             prompt_texts=prompt,
