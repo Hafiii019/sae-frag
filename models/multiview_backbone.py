@@ -26,6 +26,7 @@ class MultiViewBackbone(nn.Module):
         enhanced_1 = self.safe(c5_1, p5_1)
         enhanced_2 = self.safe(c5_2, p5_2)
 
-        fused = enhanced_1 + enhanced_2
 
+        fused = enhanced_1 + enhanced_2
+        fused = fused / 2
         return fused

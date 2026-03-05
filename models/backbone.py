@@ -1,29 +1,32 @@
-import torch
 import torch.nn as nn
 import torchvision.models as models
 
 
 class ResNet101Backbone(nn.Module):
+
     def __init__(self, pretrained=True):
         super().__init__()
 
-        weights = models.ResNet101_Weights.DEFAULT if pretrained else None
-        resnet = models.resnet101(weights=weights)
+        resnet = models.resnet101(pretrained=pretrained)
 
-        self.layer0 = nn.Sequential(
-            resnet.conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool
-        )
+        # first layers
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
 
-        self.layer1 = resnet.layer1  # C2
-        self.layer2 = resnet.layer2  # C3
-        self.layer3 = resnet.layer3  # C4
-        self.layer4 = resnet.layer4  # C5
+        # ResNet stages
+        self.layer1 = resnet.layer1   # C2
+        self.layer2 = resnet.layer2   # C3
+        self.layer3 = resnet.layer3   # C4
+        self.layer4 = resnet.layer4   # C5
 
     def forward(self, x):
-        x = self.layer0(x)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
 
         c2 = self.layer1(x)
         c3 = self.layer2(c2)

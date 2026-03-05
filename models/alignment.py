@@ -62,6 +62,6 @@ class CrossModalAlignment(nn.Module):
             text_tokens,
             text_tokens
         )
-        # attn_weights: (B, num_heads, 49, L)
+        # attn_weights: (B, 49, L)
 
         return aligned_features, cls_token, attn_weights

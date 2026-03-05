@@ -1,3 +1,4 @@
+import os
 import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -11,7 +12,14 @@ from models.projection import ProjectionHead
 from utils.losses import contrastive_loss
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ==========================
+# Setup
+# ==========================
+device = torch.device(Config.DEVICE if torch.cuda.is_available() else "cpu")
+os.makedirs("checkpoints", exist_ok=True)
+
+print("Using device:", device)
+
 
 # ==========================
 # Dataset
@@ -20,10 +28,13 @@ dataset = IUXrayMultiViewDataset(root_dir=Config.DATA_ROOT)
 
 loader = DataLoader(
     dataset,
-    batch_size=4,
+    batch_size=Config.BATCH_SIZE,
     shuffle=True,
     drop_last=True
 )
+
+print("Dataset size:", len(dataset))
+
 
 # ==========================
 # Models
@@ -38,15 +49,18 @@ optimizer = torch.optim.Adam(
     list(alignment.parameters()) +
     list(proj_img.parameters()) +
     list(proj_txt.parameters()),
-    lr=3e-5
+    lr=Config.LR
 )
 
+best_loss = float("inf")
+
 print("Starting Stage-1 Training...")
+
 
 # ==========================
 # TRAINING LOOP
 # ==========================
-for epoch in range(50):
+for epoch in range(Config.NUM_EPOCHS):
 
     visual_model.train()
     alignment.train()
@@ -54,7 +68,6 @@ for epoch in range(50):
     proj_txt.train()
 
     loop = tqdm(loader, desc=f"Epoch {epoch+1}")
-
     epoch_loss = 0.0
 
     for images, reports in loop:
@@ -81,14 +94,52 @@ for epoch in range(50):
         loop.set_postfix(loss=loss.item())
 
     avg_epoch_loss = epoch_loss / len(loader)
-    print(f"Epoch {epoch+1} Finished | Avg Loss: {avg_epoch_loss:.4f}")
+
+    print(f"Epoch {epoch+1} Finished | Avg Loss: {avg_epoch_loss:.6f}")
+
+    # Save latest checkpoint
+    torch.save({
+        "visual_model": visual_model.state_dict(),
+        "alignment": alignment.state_dict(),
+        "proj_img": proj_img.state_dict(),
+        "proj_txt": proj_txt.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "loss": avg_epoch_loss
+    }, "checkpoints/latest_stage1.pth")
+
+    # Save best checkpoint
+    if avg_epoch_loss < best_loss:
+        best_loss = avg_epoch_loss
+
+        torch.save({
+            "visual_model": visual_model.state_dict(),
+            "alignment": alignment.state_dict(),
+            "proj_img": proj_img.state_dict(),
+            "proj_txt": proj_txt.state_dict(),
+            "epoch": epoch,
+            "loss": avg_epoch_loss
+        }, "checkpoints/best_stage1.pth")
+
+        print("Saved new best model.")
+
 
 print("Training finished.")
+
+# Save final model
+torch.save({
+    "visual_model": visual_model.state_dict(),
+    "alignment": alignment.state_dict(),
+    "proj_img": proj_img.state_dict(),
+    "proj_txt": proj_txt.state_dict(),
+}, "checkpoints/final_stage1.pth")
+
+print("Final model saved.")
+
 
 # ==========================
 # TOKEN-SPECIFIC HEATMAP
 # ==========================
-
 print("Generating token-specific heatmap...")
 
 visual_model.eval()
