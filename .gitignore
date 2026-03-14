@@ -10,7 +10,12 @@ sae_frag/
 # Dataset
 data/
 *.zip
-
+*.tar.gz
+*.rar
+*.csv
+*.json
+*.png
+*.jpg
 # Model weights
 *.pt
 *.pth

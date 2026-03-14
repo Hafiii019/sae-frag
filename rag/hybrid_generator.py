@@ -13,10 +13,14 @@ class HybridReportGenerator(nn.Module):
 
         d_model = self.t5.config.d_model
 
-        # Visual projection (256 → 768)
+        # Visual projection: LayerNorm → Linear → Dropout for stable training
+        self.visual_norm = nn.LayerNorm(256)
         self.visual_proj = nn.Linear(256, d_model)
+        self.visual_drop = nn.Dropout(0.1)
 
-        # Entity embedding
+        # Entity embedding: learned embedding per pathology class.
+        # Used as a soft-weighted sum (NOT boolean selection) so that soft-AND
+        # probabilities are always meaningful — even small values contribute.
         self.entity_embed = nn.Embedding(num_entities, d_model)
 
     def forward(
@@ -32,40 +36,35 @@ class HybridReportGenerator(nn.Module):
         B = region_features.size(0)
 
         # ======================================================
-        # 1️⃣ Visual Tokens
+        # 1️⃣ Visual Tokens  (LayerNorm → Linear → Dropout)
         # ======================================================
-        visual_tokens = self.visual_proj(region_features)  # (B,49,768)
+        region_normed = self.visual_norm(region_features)           # (B, 49, 256)
+        visual_tokens = self.visual_drop(
+            self.visual_proj(region_normed)
+        )                                                           # (B, 49, d_model)
         visual_mask = torch.ones(B, visual_tokens.size(1), device=device)
 
         # ======================================================
-        # 2️⃣ Dynamic Entity Tokens (ONLY active ones)
+        # 2️⃣ Entity Token  (soft-weighted sum → 1 token per sample)
+        # ------------------------------------------------------
+        # entity_vector is a [0,1] probability vector (B, 14) from soft-AND
+        # of image-classifier and report-classifier sigmoid outputs.
+        # We compute a probability-weighted combination of the 14 learned
+        # entity embeddings, producing ONE compact token per sample.
+        # This is always well-defined (no boolean thresholding) and fully
+        # differentiable, so gradients flow back through entity weights.
         # ======================================================
-        entity_ids = torch.arange(entity_vector.size(1), device=device)
-        entity_ids = entity_ids.unsqueeze(0).expand(B, -1)
-        entity_embeddings = self.entity_embed(entity_ids)
+        entity_ids = torch.arange(
+            entity_vector.size(1), device=device
+        )                                                           # (14,)
+        all_entity_embs = self.entity_embed(entity_ids)             # (14, d_model)
 
-        entity_tokens_list = []
-        entity_mask_list = []
-
-        for b in range(B):
-            active = entity_vector[b].bool()
-            active_embeds = entity_embeddings[b][active]
-
-            if active_embeds.size(0) == 0:
-                active_embeds = torch.zeros(1, entity_embeddings.size(-1), device=device)
-
-            entity_tokens_list.append(active_embeds)
-            entity_mask_list.append(torch.ones(active_embeds.size(0), device=device))
-
-        entity_tokens = nn.utils.rnn.pad_sequence(
-            entity_tokens_list,
-            batch_first=True
-        )
-
-        entity_mask = nn.utils.rnn.pad_sequence(
-            entity_mask_list,
-            batch_first=True
-        )
+        # entity_vector: (B, 14), all_entity_embs: (14, d_model)
+        # → weighted sum: (B, d_model) → unsqueeze → (B, 1, d_model)
+        entity_token = torch.matmul(
+            entity_vector.float(), all_entity_embs
+        ).unsqueeze(1)                                              # (B, 1, d_model)
+        entity_mask = torch.ones(B, 1, device=device)
 
         # ======================================================
         # 3️⃣ Retrieved Text Tokens
@@ -102,9 +101,10 @@ class HybridReportGenerator(nn.Module):
 
         # ======================================================
         # 5️⃣ Concatenate Everything
+        # Order: visual regions | entity context | retrieved report | instruction
         # ======================================================
         encoder_inputs = torch.cat(
-            [visual_tokens, entity_tokens, retrieved_embeds, prompt_embeds],
+            [visual_tokens, entity_token, retrieved_embeds, prompt_embeds],
             dim=1
         )
 
@@ -123,16 +123,29 @@ class HybridReportGenerator(nn.Module):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=128
+                max_length=256,
             ).to(device)
+
+            # Replace padding token ids with -100 so they are ignored by CE loss
+            labels = target_enc.input_ids.clone()
+            labels[labels == self.tokenizer.pad_token_id] = -100
 
             outputs = self.t5(
                 inputs_embeds=encoder_inputs,
                 attention_mask=attention_mask,
-                labels=target_enc.input_ids
+                labels=labels,
             )
 
-            return outputs.loss
+            # Label smoothing: reduces overconfident predictions, improves BLEU/ROUGE
+            loss = outputs.loss
+            if self.training:
+                log_probs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
+                smooth_loss = -log_probs.mean(dim=-1)
+                mask = (labels != -100).float()
+                smooth_loss = (smooth_loss * mask).sum() / mask.sum()
+                loss = 0.9 * loss + 0.1 * smooth_loss
+
+            return loss
 
         # ======================================================
         # 7️⃣ Inference Mode
@@ -142,9 +155,13 @@ class HybridReportGenerator(nn.Module):
             generated_ids = self.t5.generate(
                 inputs_embeds=encoder_inputs,
                 attention_mask=attention_mask,
-                max_length=150,
-                num_beams=4,
-                length_penalty=1.0
+                max_new_tokens=200,
+                num_beams=6,
+                length_penalty=2.5,
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.5,    # penalise repeating any token
+                min_length=30,
+                early_stopping=True,
             )
 
             return self.tokenizer.batch_decode(
