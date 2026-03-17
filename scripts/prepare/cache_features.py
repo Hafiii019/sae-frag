@@ -9,6 +9,12 @@ rag/cache_train.pt  — 2695 items each with 3 retrieval variants
 rag/cache_val.pt    — 385 items each with 1 retrieval variant
 """
 
+import os
+import sys
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
+
 import pickle
 
 import faiss
@@ -25,12 +31,12 @@ from models.projection import ProjectionHead
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ROOT        = "C:/Datasets/IU_Xray"
-RETRIEVAL_K = 3
+RETRIEVAL_K = 5
 BATCH_SIZE  = 8   # larger batch — no grad, pure inference
 
 # ── Load frozen models ────────────────────────────────────────────────────
 print("Loading frozen models...")
-ckpt = torch.load("checkpoints/best_stage1.pth", map_location=DEVICE, weights_only=False)
+ckpt = torch.load(os.path.join(_ROOT, "checkpoints", "stage1", "best.pth"), map_location=DEVICE, weights_only=False)
 
 visual_encoder = MultiViewBackbone().to(DEVICE)
 visual_encoder.load_state_dict(ckpt["visual_model"])
@@ -46,18 +52,18 @@ proj_img.eval()
 
 image_classifier = SAEImageClassifier().to(DEVICE)
 image_classifier.load_state_dict(
-    torch.load("classification/image_classifier.pth", map_location=DEVICE, weights_only=False)
+    torch.load(os.path.join(_ROOT, "checkpoints", "stage2", "image_classifier.pth"), map_location=DEVICE, weights_only=False)
 )
 image_classifier.eval()
 
 report_classifier = ReportClassifier().to(DEVICE)
 report_classifier.load_state_dict(
-    torch.load("classification/report_classifier.pth", map_location=DEVICE, weights_only=False)
+    torch.load(os.path.join(_ROOT, "checkpoints", "stage2", "report_classifier.pth"), map_location=DEVICE, weights_only=False)
 )
 report_classifier.eval()
 
-index = faiss.read_index("store/faiss_index.bin")
-with open("store/train_reports.pkl", "rb") as f:
+index = faiss.read_index(os.path.join(_ROOT, "store", "faiss_index.bin"))
+with open(os.path.join(_ROOT, "store", "train_reports.pkl"), "rb") as f:
     train_metadata = pickle.load(f)
 
 print("All models loaded.")
@@ -112,8 +118,8 @@ def build_cache(split, out_path, k_variants):
 
 
 # ── Build both splits ─────────────────────────────────────────────────────
-build_cache("train", "store/cache_train.pt", k_variants=RETRIEVAL_K)
-build_cache("val",   "store/cache_val.pt",   k_variants=1)
+build_cache("train", os.path.join(_ROOT, "store", "cache_train.pt"), k_variants=RETRIEVAL_K)
+build_cache("val",   os.path.join(_ROOT, "store", "cache_val.pt"),   k_variants=1)
 
 print("\nDone. Now run:")
-print("  python training/train_cached.py")
+print("  python scripts/train/train_stage3.py")

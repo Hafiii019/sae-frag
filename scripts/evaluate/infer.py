@@ -1,4 +1,10 @@
 import argparse
+import os
+import sys
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
+
 import pickle
 import torch
 import faiss
@@ -22,7 +28,7 @@ args = parser.parse_args()
 
 # ── Load models ───────────────────────────────────────────────────────────────
 print("Loading models...")
-ckpt = torch.load("checkpoints/best_stage1.pth", map_location=DEVICE, weights_only=False)
+ckpt = torch.load(os.path.join(_ROOT, "checkpoints", "stage1", "best.pth"), map_location=DEVICE, weights_only=False)
 
 enc = MultiViewBackbone().to(DEVICE)
 enc.load_state_dict(ckpt["visual_model"])
@@ -37,17 +43,17 @@ prj.load_state_dict(ckpt["proj_img"])
 prj.eval()
 
 ic = SAEImageClassifier().to(DEVICE)
-ic.load_state_dict(torch.load("classification/image_classifier.pth", map_location=DEVICE, weights_only=False))
+ic.load_state_dict(torch.load(os.path.join(_ROOT, "checkpoints", "stage2", "image_classifier.pth"), map_location=DEVICE, weights_only=False))
 ic.eval()
 
 rc = ReportClassifier().to(DEVICE)
-rc.load_state_dict(torch.load("classification/report_classifier.pth", map_location=DEVICE, weights_only=False))
+rc.load_state_dict(torch.load(os.path.join(_ROOT, "checkpoints", "stage2", "report_classifier.pth"), map_location=DEVICE, weights_only=False))
 rc.eval()
 
 gen = HybridReportGenerator().to(DEVICE)
-_model_path = "checkpoints/best_generator.pth"
+_model_path = os.path.join(_ROOT, "checkpoints", "stage3", "best_generator.pth")
 if not os.path.exists(_model_path):
-    for _fb in ["checkpoints/last_generator.pth"]:
+    for _fb in [os.path.join(_ROOT, "checkpoints", "stage3", "last_generator.pth")]:
         if os.path.exists(_fb):
             _model_path = _fb
             break
@@ -58,8 +64,8 @@ gen.load_state_dict(
 )
 gen.eval()
 
-idx_db   = faiss.read_index("store/faiss_index.bin")
-meta     = pickle.load(open("store/train_reports.pkl", "rb"))
+idx_db   = faiss.read_index(os.path.join(_ROOT, "store", "faiss_index.bin"))
+meta     = pickle.load(open(os.path.join(_ROOT, "store", "train_reports.pkl"), "rb"))
 verifier = ReportVerifier(aln, min_score=0.0)
 
 print("Models loaded.\n")

@@ -1,4 +1,11 @@
 import json
+import os
+import sys
+
+# Bootstrap: make src/ importable
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
 import torch
 import faiss
 import pickle
@@ -19,7 +26,7 @@ dataset = IUXrayMultiViewDataset(ROOT, split="train")
 loader = DataLoader(dataset, batch_size=1)
 
 # Load Stage-1
-checkpoint = torch.load("checkpoints/best_stage1.pth", map_location=device)
+checkpoint = torch.load(os.path.join(ROOT, "checkpoints", "stage1", "best.pth"), map_location=device)
 
 visual_encoder = MultiViewBackbone().to(device)
 visual_encoder.load_state_dict(checkpoint["visual_model"])
@@ -32,7 +39,7 @@ proj_img.eval()
 # Load report classifier ONCE
 report_classifier = ReportClassifier().to(device)
 report_classifier.load_state_dict(
-    torch.load("classification/report_classifier.pth", map_location=device)
+    torch.load(os.path.join(ROOT, "checkpoints", "stage2", "report_classifier.pth"), map_location=device)
 )
 report_classifier.eval()
 
@@ -67,9 +74,9 @@ embeddings = np.vstack(embeddings).astype("float32")
 index = faiss.IndexFlatL2(embeddings.shape[1])
 index.add(embeddings)
 
-faiss.write_index(index, "store/faiss_index.bin")
+faiss.write_index(index, os.path.join(ROOT, "store", "faiss_index.bin"))
 
-with open("store/train_reports.pkl", "wb") as f:
+with open(os.path.join(ROOT, "store", "train_reports.pkl"), "wb") as f:
     pickle.dump(metadata, f)
 
 print("✅ FAST FAISS built.")
@@ -81,7 +88,7 @@ print("✅ FAST FAISS built.")
 # so we avoid loading a second copy of the BERT weights.
 extractor = RadGraphExtractor(
     device=str(device),
-    cache_path="store/radgraph_cache.json",
+    cache_path=os.path.join(ROOT, "store", "radgraph_cache.json"),
 )
 
 bert_encoder  = report_classifier.encoder    # Bio_ClinicalBERT AutoModel
@@ -111,7 +118,7 @@ for sample in tqdm(metadata, desc="RadGraph"):
 extractor.save_cache()
 
 radgraph_embeddings_np = np.vstack(radgraph_embeddings).astype("float32")  # (N, 768)
-np.save("store/radgraph_entity_embeddings.npy", radgraph_embeddings_np)
+np.save(os.path.join(ROOT, "store", "radgraph_entity_embeddings.npy"), radgraph_embeddings_np)
 
 with open("rag/radgraph_entity_labels.json", "w", encoding="utf-8") as fh:
     json.dump(radgraph_labels, fh, indent=2, ensure_ascii=False)

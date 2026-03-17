@@ -1,0 +1,22 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Transformers & NLP
+transformers>=4.35.0
+sentencepiece
+
+# FAISS (use faiss-gpu if CUDA is available)
+faiss-cpu>=1.7.4
+
+# NLP evaluation metrics
+nltk>=3.8
+rouge-score>=0.1.2
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Utilities
+tqdm>=4.65.0

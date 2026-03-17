@@ -5,7 +5,7 @@ from transformers import T5ForConditionalGeneration, T5Tokenizer
 
 class HybridReportGenerator(nn.Module):
 
-    def __init__(self, num_entities=14, model_name="google/flan-t5-base"):
+    def __init__(self, num_entities=14, model_name="google/flan-t5-large"):
         super().__init__()
 
         self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
@@ -74,7 +74,7 @@ class HybridReportGenerator(nn.Module):
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=128
+            max_length=256
         ).to(device)
 
         retrieved_embeds = self.t5.encoder.embed_tokens(
@@ -123,7 +123,7 @@ class HybridReportGenerator(nn.Module):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=256,
+                max_length=512,
             ).to(device)
 
             # Replace padding token ids with -100 so they are ignored by CE loss
@@ -155,12 +155,12 @@ class HybridReportGenerator(nn.Module):
             generated_ids = self.t5.generate(
                 inputs_embeds=encoder_inputs,
                 attention_mask=attention_mask,
-                max_new_tokens=200,
-                num_beams=6,
-                length_penalty=2.5,
+                max_new_tokens=300,
+                num_beams=8,
+                length_penalty=1.5,
                 no_repeat_ngram_size=3,
-                repetition_penalty=1.5,    # penalise repeating any token
-                min_length=30,
+                repetition_penalty=1.3,
+                min_length=40,
                 early_stopping=True,
             )
 

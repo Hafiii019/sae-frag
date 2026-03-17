@@ -1,25 +1,21 @@
-"""Fast hybrid generator training using pre-cached frozen model outputs.
+"""Stage 3: Train the HybridReportGenerator using pre-cached frozen model outputs.
 
-Only HybridReportGenerator is loaded into GPU — no BERT in the training loop.
-Per-step time: ~1-2s vs ~10s in the original script (~8x faster).
+Only the generator is loaded onto GPU — no BERT in the training loop.
+Per-step time: ~1-2s   (vs ~10s in the uncached version).
 
 Prerequisites
 -------------
-Run rag/cache_features.py first to build rag/cache_train.pt and rag/cache_val.pt.
+  python scripts/prepare/cache_features.py
 
-Outputs (all saved to models/)
--------------------------------
-models/best_generator.pth   — best checkpoint by val loss (use for eval/inference)
-models/last_generator.pth   — last epoch checkpoint
-models/resume.pt            — full training state for --resume
+Outputs  →  checkpoints/stage3/
+  best_generator.pth   best checkpoint by val loss  (use for eval / inference)
+  last_generator.pth   most recent epoch checkpoint
+  resume.pt            full training state for --resume
 
 Usage
 -----
-  # fresh start
-  python rag/train_cached.py
-
-  # resume interrupted run
-  python rag/train_cached.py --resume
+  python scripts/train/train_stage3.py            # fresh start
+  python scripts/train/train_stage3.py --resume   # continue from last checkpoint
 """
 
 import argparse
@@ -27,7 +23,9 @@ import os
 import random
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# ── Bootstrap: make src/ importable regardless of cwd ──────────────────────
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(ROOT, "src"))
 
 import torch
 import torch.amp
@@ -45,24 +43,24 @@ args = parser.parse_args()
 
 # ── Config ────────────────────────────────────────────────────────────────
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_EPOCHS   = 50
-BATCH_SIZE   = 8
-ACCUM_STEPS  = 2           # effective batch = 16
-WARMUP_STEPS = 100
-LR_T5        = 1e-5
-LR_NEW       = 5e-5
+NUM_EPOCHS   = 100
+BATCH_SIZE   = 4
+ACCUM_STEPS  = 4           # effective batch = 16
+WARMUP_STEPS = 300
+LR_T5        = 5e-6
+LR_NEW       = 2e-5
 WEIGHT_DECAY = 0.01
 GRAD_CLIP    = 0.5
-TRAIN_CACHE  = "store/cache_train.pt"
-VAL_CACHE    = "store/cache_val.pt"
+TRAIN_CACHE  = os.path.join(ROOT, "store", "cache_train.pt")
+VAL_CACHE    = os.path.join(ROOT, "store", "cache_val.pt")
 
-# Output paths — all inside checkpoints/
-MODELS_DIR  = "checkpoints"
-BEST_CKPT   = os.path.join(MODELS_DIR, "best_generator.pth")
-LAST_CKPT   = os.path.join(MODELS_DIR, "last_generator.pth")
-RESUME_FILE = os.path.join(MODELS_DIR, "resume.pt")
+# Output paths
+STAGE3_DIR  = os.path.join(ROOT, "checkpoints", "stage3")
+BEST_CKPT   = os.path.join(STAGE3_DIR, "best_generator.pth")
+LAST_CKPT   = os.path.join(STAGE3_DIR, "last_generator.pth")
+RESUME_FILE = os.path.join(STAGE3_DIR, "resume.pt")
 
-os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(STAGE3_DIR, exist_ok=True)
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────
@@ -104,7 +102,7 @@ def collate_fn(batch):
 
 
 assert os.path.exists(TRAIN_CACHE), (
-    f"Cache not found at {TRAIN_CACHE}. Run: python training/cache_features.py"
+    f"Cache not found: {TRAIN_CACHE}\nRun: python scripts/prepare/cache_features.py"
 )
 
 train_dataset = CachedFeaturesDataset(TRAIN_CACHE)
@@ -128,8 +126,8 @@ generator = HybridReportGenerator().to(DEVICE)
 #  2. rag/hybrid_generator_best.pth  (legacy path from old script)
 #  3. rag/hybrid_generator.pth       (legacy last checkpoint)
 for warm_path in [BEST_CKPT,
-                  "checkpoints/best_generator.pth",
-                  "checkpoints/last_generator.pth"]:
+                  os.path.join(ROOT, "checkpoints", "stage3", "best_generator.pth"),
+                  os.path.join(ROOT, "checkpoints", "best_generator.pth")]:
     if os.path.exists(warm_path):
         state = torch.load(warm_path, map_location=DEVICE, weights_only=False)
         generator.load_state_dict(state, strict=False)
@@ -158,6 +156,8 @@ scheduler   = get_cosine_schedule_with_warmup(optimizer, WARMUP_STEPS, total_ste
 # ── Resume ────────────────────────────────────────────────────────────────
 start_epoch   = 0
 best_val_loss = float("inf")
+patience      = 5
+no_improve    = 0
 
 if args.resume and os.path.exists(RESUME_FILE):
     resume = torch.load(RESUME_FILE, map_location=DEVICE, weights_only=False)
@@ -166,14 +166,15 @@ if args.resume and os.path.exists(RESUME_FILE):
     scheduler.load_state_dict(resume["scheduler"])
     start_epoch   = resume["epoch"] + 1
     best_val_loss = resume["best_val_loss"]
-    print(f"Resumed from epoch {resume['epoch']+1} | best_val_loss={best_val_loss:.4f}")
+    no_improve    = resume.get("no_improve", 0)
+    print(f"Resumed from epoch {resume['epoch']+1} | best_val_loss={best_val_loss:.4f} | no_improve={no_improve}")
 elif args.resume:
     print("--resume requested but no resume.pt found. Starting fresh.")
 
 print(f"\ndevice={DEVICE} | {len(train_dataset)} train / {len(val_dataset)} val")
 print(f"batch={BATCH_SIZE} x accum={ACCUM_STEPS} = effective {BATCH_SIZE * ACCUM_STEPS}")
 print(f"epochs={NUM_EPOCHS} (starting from {start_epoch+1}) | total optim steps={total_steps}")
-print(f"Outputs -> {MODELS_DIR}/\n")
+print(f"Outputs -> {STAGE3_DIR}/\n")
 
 # ── Train loop ────────────────────────────────────────────────────────────
 for epoch in range(start_epoch, NUM_EPOCHS):
@@ -257,13 +258,21 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         "optimizer":      optimizer.state_dict(),
         "scheduler":      scheduler.state_dict(),
         "best_val_loss":  best_val_loss,
+        "no_improve":     no_improve,
     }, RESUME_FILE)
 
     # Save best checkpoint
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
+        no_improve    = 0
         torch.save(generator.state_dict(), BEST_CKPT)
         print(f"  ** Best model saved -> {BEST_CKPT}  (val={best_val_loss:.4f})")
+    else:
+        no_improve += 1
+        print(f"  No improvement for {no_improve}/{patience} epochs")
+        if no_improve >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs.")
+            break
 
 print("\nTraining Complete")
 print(f"Best val loss : {best_val_loss:.4f}")

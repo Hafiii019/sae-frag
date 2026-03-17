@@ -1,4 +1,9 @@
 import os
+import sys
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
+
 import torch
 import numpy as np
 import faiss
@@ -33,15 +38,15 @@ test_loader = DataLoader(test_dataset, batch_size=1)
 # ------------------------------------------------
 # LOAD FAISS + TRAIN METADATA
 # ------------------------------------------------
-index = faiss.read_index("store/faiss_index.bin")
+index = faiss.read_index(os.path.join(_ROOT, "store", "faiss_index.bin"))
 
-with open("store/train_reports.pkl", "rb") as f:
+with open(os.path.join(_ROOT, "store", "train_reports.pkl"), "rb") as f:
     train_metadata = pickle.load(f)
 
 # ------------------------------------------------
 # LOAD STAGE-1 MODELS (FROZEN)
 # ------------------------------------------------
-checkpoint = torch.load("checkpoints/best_stage1.pth", map_location=device)
+checkpoint = torch.load(os.path.join(_ROOT, "checkpoints", "stage1", "best.pth"), map_location=device)
 
 visual_encoder = MultiViewBackbone().to(device)
 visual_encoder.load_state_dict(checkpoint["visual_model"])
@@ -59,20 +64,20 @@ proj_img.eval()
 
 image_classifier = SAEImageClassifier().to(device)
 image_classifier.load_state_dict(
-    torch.load("classification/image_classifier.pth", map_location=device)
+    torch.load(os.path.join(_ROOT, "checkpoints", "stage2", "image_classifier.pth"), map_location=device)
 )
 image_classifier.eval()
 
 report_classifier = ReportClassifier().to(device)
 report_classifier.load_state_dict(
-    torch.load("classification/report_classifier.pth", map_location=device)
+    torch.load(os.path.join(_ROOT, "checkpoints", "stage2", "report_classifier.pth"), map_location=device)
 )
 report_classifier.eval()
 
 generator = HybridReportGenerator().to(device)
-MODEL_PATH = "checkpoints/best_generator.pth"
+MODEL_PATH = os.path.join(_ROOT, "checkpoints", "stage3", "best_generator.pth")
 if not os.path.exists(MODEL_PATH):
-    for fallback in ["checkpoints/last_generator.pth"]:
+    for fallback in [os.path.join(_ROOT, "checkpoints", "stage3", "last_generator.pth")]:
         if os.path.exists(fallback):
             MODEL_PATH = fallback
             break
