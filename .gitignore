@@ -6,24 +6,33 @@ __pycache__/
 venv/
 env/
 sae_frag/
+.conda/
 
-# Dataset
-data/
+# Dataset images and large files (keep on Drive, not GitHub)
+Datasets/
 *.zip
 *.tar.gz
 *.rar
-*.csv
-*.json
 *.png
 *.jpg
-# Model weights
+
+# Large binary store files (too big for GitHub)
+store/
 *.pt
 *.pth
 *.ckpt
+*.npy
+*.bin
+*.pkl
 
-# Logs
+# Logs and outputs
 *.log
+train_output.txt
+eval_output.txt
 
-# VS Code
+# VS Code / env
 .vscode/
-*.env
+.env
+
+# Keep these CSVs (split definitions needed on Colab)
+!data/splits/iu_split.csv

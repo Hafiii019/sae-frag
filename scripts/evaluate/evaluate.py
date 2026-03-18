@@ -27,7 +27,7 @@ from rag.verifier import ReportVerifier
 nltk.download("wordnet")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ROOT = "C:/Datasets/IU_Xray"
+ROOT = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
 
 # ------------------------------------------------
 # LOAD TEST DATA

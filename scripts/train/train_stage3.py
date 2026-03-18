@@ -43,12 +43,12 @@ args = parser.parse_args()
 
 # ── Config ────────────────────────────────────────────────────────────────
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_EPOCHS   = 100
-BATCH_SIZE   = 4
-ACCUM_STEPS  = 4           # effective batch = 16
-WARMUP_STEPS = 300
-LR_T5        = 5e-6
-LR_NEW       = 2e-5
+NUM_EPOCHS   = 50
+BATCH_SIZE   = 8
+ACCUM_STEPS  = 2           # effective batch = 16
+WARMUP_STEPS = 200
+LR_T5        = 1e-5
+LR_NEW       = 5e-5
 WEIGHT_DECAY = 0.01
 GRAD_CLIP    = 0.5
 TRAIN_CACHE  = os.path.join(ROOT, "store", "cache_train.pt")
@@ -121,20 +121,27 @@ val_loader = DataLoader(
 # ── Generator ─────────────────────────────────────────────────────────────
 generator = HybridReportGenerator().to(DEVICE)
 
-# Warm-start priority:
-#  1. models/best_generator.pth  (previous best from this script)
-#  2. rag/hybrid_generator_best.pth  (legacy path from old script)
-#  3. rag/hybrid_generator.pth       (legacy last checkpoint)
+# Warm-start: only load a checkpoint if it matches the current architecture.
+# Skips silently if shapes differ (e.g. old flan-t5-base ckpt vs current large).
+_loaded = False
 for warm_path in [BEST_CKPT,
                   os.path.join(ROOT, "checkpoints", "stage3", "best_generator.pth"),
                   os.path.join(ROOT, "checkpoints", "best_generator.pth")]:
-    if os.path.exists(warm_path):
-        state = torch.load(warm_path, map_location=DEVICE, weights_only=False)
-        generator.load_state_dict(state, strict=False)
-        print(f"Warm-started generator from {warm_path}")
-        break
-else:
-    print("No prior checkpoint — training from scratch.")
+    if not os.path.exists(warm_path):
+        continue
+    state = torch.load(warm_path, map_location=DEVICE, weights_only=False)
+    current_shapes = {k: v.shape for k, v in generator.state_dict().items()}
+    mismatched = [k for k, v in state.items() if k in current_shapes and v.shape != current_shapes[k]]
+    if mismatched:
+        print(f"Skipping {warm_path} — {len(mismatched)} shape mismatches (different model size).")
+        continue
+    generator.load_state_dict(state, strict=False)
+    print(f"Warm-started generator from {warm_path}")
+    _loaded = True
+    break
+
+if not _loaded:
+    print("No compatible checkpoint found — training from scratch.")
 
 
 # ── Optimizer & scheduler ─────────────────────────────────────────────────

@@ -20,9 +20,9 @@ from classification.report_labeler import ReportClassifier
 from rag.radgraph_extractor import RadGraphExtractor
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ROOT = "C:/Datasets/IU_Xray"
+DATA_ROOT = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
 
-dataset = IUXrayMultiViewDataset(ROOT, split="train")
+dataset = IUXrayMultiViewDataset(DATA_ROOT, split="train")
 loader = DataLoader(dataset, batch_size=1)
 
 # Load Stage-1
@@ -120,7 +120,7 @@ extractor.save_cache()
 radgraph_embeddings_np = np.vstack(radgraph_embeddings).astype("float32")  # (N, 768)
 np.save(os.path.join(ROOT, "store", "radgraph_entity_embeddings.npy"), radgraph_embeddings_np)
 
-with open("rag/radgraph_entity_labels.json", "w", encoding="utf-8") as fh:
+with open(os.path.join(ROOT, "store", "radgraph_entity_labels.json"), "w", encoding="utf-8") as fh:
     json.dump(radgraph_labels, fh, indent=2, ensure_ascii=False)
 
 print(f"✅ RadGraph metadata saved — shape: {radgraph_embeddings_np.shape}")

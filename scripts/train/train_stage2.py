@@ -24,7 +24,7 @@ from classification.report_labeler import ReportClassifier
 # =========================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-ROOT = "C:/Datasets/IU_Xray"
+ROOT = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
 
 
 # =========================================
@@ -37,7 +37,7 @@ dataset = IUXrayMultiViewDataset(
 
 loader = DataLoader(
     dataset,
-    batch_size=4,
+    batch_size=16,
     shuffle=True,
     drop_last=True
 )
@@ -68,12 +68,14 @@ RESUME_FILE = os.path.join(CKPT2_DIR, "resume.pt")
 os.makedirs(CKPT2_DIR, exist_ok=True)
 
 criterion = torch.nn.BCEWithLogitsLoss()
-optimizer = torch.optim.Adam(
+optimizer = torch.optim.AdamW(
     image_model.parameters(),
-    lr=1e-4
+    lr=3e-4,
+    weight_decay=1e-4,
 )
 
-NUM_EPOCHS  = 20
+BEST_CKPT   = os.path.join(CKPT2_DIR, "image_classifier.pth")
+NUM_EPOCHS  = 25
 start_epoch = 0
 patience    = 5
 no_improve  = 0
@@ -91,6 +93,10 @@ if args.resume and os.path.exists(RESUME_FILE):
 elif args.resume:
     print("--resume requested but no resume.pt found. Starting fresh.")
 
+# Cosine LR scheduler — decays smoothly to near-zero over all epochs
+from torch.optim.lr_scheduler import CosineAnnealingLR
+scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+
 print("====================================")
 print("Starting Image Classifier Training")
 print("====================================")
@@ -106,12 +112,11 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
         images = images.to(device)
 
-        # Generate pseudo-labels from report classifier
+        # Soft pseudo-labels: keep the full [0,1] confidence from the text
+        # classifier rather than hard-thresholding. This retains uncertainty
+        # information and gives much stronger learning signal.
         with torch.no_grad():
-            report_logits = report_model(reports)
-            labels = (torch.sigmoid(report_logits) > 0.3).float()
-
-        labels = labels.to(device)
+            labels = torch.sigmoid(report_model(reports)).to(device)
 
         logits = image_model(images)
 
@@ -125,13 +130,17 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         loop.set_postfix(loss=loss.item())
 
     avg_loss = total_loss / len(loader)
-    print(f"Epoch {epoch+1}/{NUM_EPOCHS} | avg_loss={avg_loss:.4f}")
+    lr_now   = optimizer.param_groups[0]["lr"]
+    print(f"Epoch {epoch+1}/{NUM_EPOCHS} | avg_loss={avg_loss:.4f} | lr={lr_now:.2e}")
 
-    # Save resume state every epoch so training can be continued
+    scheduler.step()
+
+    # Save resume state every epoch
     torch.save({
         "epoch":      epoch,
         "model":      image_model.state_dict(),
         "optimizer":  optimizer.state_dict(),
+        "scheduler":  scheduler.state_dict(),
         "best_loss":  best_loss,
         "no_improve": no_improve,
     }, RESUME_FILE)
@@ -139,6 +148,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     if avg_loss < best_loss:
         best_loss  = avg_loss
         no_improve = 0
+        torch.save(image_model.state_dict(), BEST_CKPT)
+        print(f"  ** Best model saved (loss={best_loss:.4f})")
     else:
         no_improve += 1
         print(f"  No improvement for {no_improve}/{patience} epochs")
@@ -146,11 +157,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             print(f"Early stopping triggered after {epoch+1} epochs.")
             break
 
-_save_path = os.path.join(CKPT2_DIR, "image_classifier.pth")
-torch.save(image_model.state_dict(), _save_path)
-
 print("====================================")
 print("Image classifier training complete.")
-print(f"Model saved to {_save_path}")
-print(f"Resume state -> {RESUME_FILE}")
+print(f"Best model -> {BEST_CKPT}")
+print(f"Resume     -> {RESUME_FILE}")
 print("====================================")

@@ -20,7 +20,7 @@ from rag.hybrid_generator                import HybridReportGenerator
 from rag.verifier                        import ReportVerifier
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ROOT   = "C:/Datasets/IU_Xray"
+ROOT   = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--idx", type=int, default=0, help="Test-split index (0-770)")

@@ -30,7 +30,7 @@ from models.multiview_backbone import MultiViewBackbone
 from models.projection import ProjectionHead
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ROOT        = "C:/Datasets/IU_Xray"
+ROOT        = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
 RETRIEVAL_K = 5
 BATCH_SIZE  = 8   # larger batch — no grad, pure inference
 

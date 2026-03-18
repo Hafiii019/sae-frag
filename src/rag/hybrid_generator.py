@@ -5,7 +5,7 @@ from transformers import T5ForConditionalGeneration, T5Tokenizer
 
 class HybridReportGenerator(nn.Module):
 
-    def __init__(self, num_entities=14, model_name="google/flan-t5-large"):
+    def __init__(self, num_entities=14, model_name="google/flan-t5-base"):
         super().__init__()
 
         self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
