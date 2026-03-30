@@ -24,13 +24,14 @@ from tqdm import tqdm
 
 from classification.report_labeler import ReportClassifier
 from classification.sae_image_classifier import SAEImageClassifier
+from configs.config import Config
 from data.dataset import IUXrayMultiViewDataset
 from models.alignment import CrossModalAlignment
 from models.multiview_backbone import MultiViewBackbone
 from models.projection import ProjectionHead
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ROOT        = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
+ROOT        = Config.DATA_ROOT
 RETRIEVAL_K = 5
 BATCH_SIZE  = 8   # larger batch — no grad, pure inference
 
@@ -84,6 +85,7 @@ def build_cache(split, out_path, k_variants):
             global_feat     = visual_features.flatten(2).mean(dim=2)        # (B,256)
             img_emb         = proj_img(global_feat)                         # (B,768)
             img_np          = img_emb.cpu().numpy().astype("float32")
+            faiss.normalize_L2(img_np)   # match IndexFlatIP index
 
             _, I = index.search(img_np, k=k_variants)                       # (B, k)
 

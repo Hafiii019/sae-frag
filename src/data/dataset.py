@@ -83,35 +83,31 @@ class IUXrayMultiViewDataset(Dataset):
 
         # ------------------------
         # Image transforms
+        # Train uses augmentation; val/test use deterministic resize only.
+        # Conservative augmentations chosen for medical imaging:
+        #  - No horizontal flip (flipping changes cardiac/aortic anatomy)
+        #  - Small rotation (patient positioning ±10°)
+        #  - Slight colour jitter (scanner/contrast variation)
         # ------------------------
+        _norm = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
 
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-
-    
-    def clean_report(self, text):
-
-        text = text.lower()
-
-        # remove IU-Xray placeholders
-        text = text.replace("xxxx", "")
-        text = text.replace("x-xxxx", "")
-        text = text.replace("xxxx.", "")
-
-        # remove leftover artifacts
-        text = text.replace("x-", "")
-
-        # collapse spaces
-        text = " ".join(text.split())
-
-        return text
-
+        if split == "train":
+            self.transform = transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.RandomRotation(degrees=10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                _norm,
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                _norm,
+            ])
 
     def __len__(self):
         return len(self.samples)
@@ -142,10 +138,7 @@ class IUXrayMultiViewDataset(Dataset):
 
         images = torch.stack(images)
 
-        # ------------------------
-        # Clean report
-        # ------------------------
-
-        report = self.clean_report(sample["report"])
+        # Report is already cleaned by _clean_report() during __init__
+        report = sample["report"]
 
         return images, report

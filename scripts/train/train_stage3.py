@@ -43,6 +43,7 @@ args = parser.parse_args()
 
 # ── Config ────────────────────────────────────────────────────────────────
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP      = DEVICE.type == "cuda"
 NUM_EPOCHS   = 50
 BATCH_SIZE   = 8
 ACCUM_STEPS  = 2           # effective batch = 16
@@ -201,7 +202,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         ] * len(reports)
 
         # BFloat16 AMP — same exponent range as FP32, no NaN risk
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP, dtype=torch.bfloat16):
             loss = generator(
                 region_features=aligned_features,
                 entity_vector=entity_vector,
@@ -224,7 +225,14 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             loss=f"{total_loss / (step + 1):.4f}",
             lr=f"{scheduler.get_last_lr()[0]:.2e}",
         )
-
+    # Flush any leftover accumulated gradient at the end of the epoch
+    # (when len(train_loader) % ACCUM_STEPS != 0 the final mini-steps would
+    # otherwise be silently discarded).
+    if (len(train_loader) % ACCUM_STEPS) != 0:
+        torch.nn.utils.clip_grad_norm_(generator.parameters(), GRAD_CLIP)
+        optimizer.step()
+        optimizer.zero_grad()
+        scheduler.step()
     avg_train_loss = total_loss / len(train_loader)
 
     # ── Validation ────────────────────────────────────────────────────────
@@ -236,7 +244,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             val_af = val_af.to(DEVICE)
             val_ev = val_ev.to(DEVICE)
 
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP, dtype=torch.bfloat16):
                 vl = generator(
                     region_features=val_af,
                     entity_vector=val_ev,

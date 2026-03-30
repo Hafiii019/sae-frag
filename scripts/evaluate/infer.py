@@ -10,6 +10,7 @@ import torch
 import faiss
 import torch.nn.functional as F
 
+from configs.config                      import Config
 from data.dataset                        import IUXrayMultiViewDataset
 from models.multiview_backbone           import MultiViewBackbone
 from models.alignment                    import CrossModalAlignment
@@ -20,7 +21,7 @@ from rag.hybrid_generator                import HybridReportGenerator
 from rag.verifier                        import ReportVerifier
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ROOT   = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
+ROOT   = Config.DATA_ROOT
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--idx", type=int, default=0, help="Test-split index (0-770)")
@@ -83,6 +84,7 @@ with torch.no_grad():
     feat = enc(x)
 
     q    = F.normalize(prj(feat.flatten(2).mean(2)), dim=1).cpu().numpy().astype("float32")
+    faiss.normalize_L2(q)            # match IndexFlatIP index
     _, I = idx_db.search(q, 5)
     cands = [meta[i]["report"] for i in I[0]]
 

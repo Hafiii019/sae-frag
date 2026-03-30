@@ -13,6 +13,7 @@ import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
+from configs.config import Config
 from data.dataset import IUXrayMultiViewDataset
 from models.multiview_backbone import MultiViewBackbone
 from models.projection import ProjectionHead
@@ -20,7 +21,7 @@ from classification.report_labeler import ReportClassifier
 from rag.radgraph_extractor import RadGraphExtractor
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DATA_ROOT = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
+DATA_ROOT = Config.DATA_ROOT
 
 dataset = IUXrayMultiViewDataset(DATA_ROOT, split="train")
 loader = DataLoader(dataset, batch_size=1)
@@ -71,7 +72,10 @@ with torch.no_grad():
 
 embeddings = np.vstack(embeddings).astype("float32")
 
-index = faiss.IndexFlatL2(embeddings.shape[1])
+# ProjectionHead outputs L2-normalised vectors, so inner-product search
+# is equivalent to cosine similarity and is the correct metric.
+faiss.normalize_L2(embeddings)   # ensure unit norm
+index = faiss.IndexFlatIP(embeddings.shape[1])
 index.add(embeddings)
 
 faiss.write_index(index, os.path.join(ROOT, "store", "faiss_index.bin"))

@@ -7,7 +7,8 @@ class ResNet101Backbone(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
 
-        resnet = models.resnet101(pretrained=pretrained)
+        weights = models.ResNet101_Weights.IMAGENET1K_V2 if pretrained else None
+        resnet = models.resnet101(weights=weights)
 
         # first layers as layer0
         self.layer0 = nn.Sequential(

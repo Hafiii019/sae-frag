@@ -1,3 +1,20 @@
+"""Stage 2b: Train SAEImageClassifier using soft pseudo-labels from ReportClassifier.
+
+Key improvements over baseline
+--------------------------------
+* Stage-1 backbone weights loaded as initialisation (not random)
+* Early backbone layers (stem + stages 0-3) frozen — only layer4, FPN, SAFE,
+  and the classification head are updated, preserving contrastive features
+* AMP (bfloat16) for ~2x speed-up on CUDA
+* BCEWithLogitsLoss with per-class pos_weight to handle IU-Xray label imbalance
+* Gradient clipping (max_norm=1.0)
+
+Prerequisites
+-------------
+  python scripts/train/train_stage1.py
+  python scripts/train/train_report_classifier.py
+"""
+
 import argparse
 import os
 import sys
@@ -14,6 +31,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from configs.config import Config
 from data.dataset import IUXrayMultiViewDataset
 from classification.sae_image_classifier import SAEImageClassifier
 from classification.report_labeler import ReportClassifier
@@ -22,10 +40,11 @@ from classification.report_labeler import ReportClassifier
 # =========================================
 # Device
 # =========================================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = device.type == "cuda"
+ROOT    = Config.DATA_ROOT
 
-ROOT = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
-
+print(f"device={device} | AMP={USE_AMP}")
 
 # =========================================
 # TRAIN SPLIT ONLY
@@ -39,7 +58,8 @@ loader = DataLoader(
     dataset,
     batch_size=16,
     shuffle=True,
-    drop_last=True
+    drop_last=True,
+    pin_memory=USE_AMP,
 )
 
 
@@ -63,13 +83,44 @@ report_model.eval()
 # =========================================
 image_model = SAEImageClassifier().to(device)
 
+# ── Warm-start backbone from Stage-1 contrastive checkpoint ──────────────
+# Loading stage-1 weights before Stage-2 training means the backbone starts
+# from a vision-language-aligned feature space rather than plain ImageNet.
+S1_CKPT = os.path.join(PROJ_ROOT, "checkpoints", "stage1", "best.pth")
+if os.path.exists(S1_CKPT):
+    s1_weights = torch.load(S1_CKPT, map_location=device, weights_only=False)
+    image_model.backbone.load_state_dict(s1_weights["visual_model"])
+    print(f"Loaded Stage-1 backbone from {S1_CKPT}")
+else:
+    print(f"WARNING: Stage-1 checkpoint not found at {S1_CKPT} — training from ImageNet init.")
+
+# ── Freeze stem + ResNet stages 0-3 to preserve Stage-1 features ─────────
+# Only layer4 (high-level semantics), FPN, SAFE, and the head are updated.
+frozen, trainable = 0, 0
+for name, param in image_model.backbone.named_parameters():
+    if any(f"backbone.layer{i}" in name for i in range(4)):  # layer0..layer3
+        param.requires_grad = False
+        frozen += param.numel()
+    else:
+        param.requires_grad = True
+        trainable += param.numel()
+print(f"Backbone: frozen={frozen/1e6:.1f}M params | trainable={trainable/1e6:.1f}M params")
+
 CKPT2_DIR   = os.path.join(PROJ_ROOT, "checkpoints", "stage2")
 RESUME_FILE = os.path.join(CKPT2_DIR, "resume.pt")
 os.makedirs(CKPT2_DIR, exist_ok=True)
 
-criterion = torch.nn.BCEWithLogitsLoss()
+# ── BCEWithLogitsLoss with pos_weight for label imbalance ─────────────────
+# Chest pathologies are rare; without pos_weight the model predicts all-negative.
+# A conservative weight of 5 (tunable) gives ~5× more gradient for positives.
+pos_weight = torch.ones(14, device=device) * 5.0
+criterion  = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+# AMP scaler
+scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+
 optimizer = torch.optim.AdamW(
-    image_model.parameters(),
+    filter(lambda p: p.requires_grad, image_model.parameters()),
     lr=3e-4,
     weight_decay=1e-4,
 )
@@ -118,13 +169,18 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         with torch.no_grad():
             labels = torch.sigmoid(report_model(reports)).to(device)
 
-        logits = image_model(images)
-
-        loss = criterion(logits, labels)
+        with torch.amp.autocast(device_type="cuda", enabled=USE_AMP, dtype=torch.bfloat16):
+            logits = image_model(images)
+            loss   = criterion(logits, labels)
 
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            filter(lambda p: p.requires_grad, image_model.parameters()), 1.0
+        )
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         loop.set_postfix(loss=loss.item())

@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(_ROOT, "src"))
@@ -9,12 +10,13 @@ import numpy as np
 import faiss
 import pickle
 from tqdm import tqdm
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
 import nltk
 
 from torch.utils.data import DataLoader
+from configs.config import Config
 from data.dataset import IUXrayMultiViewDataset
 from models.multiview_backbone import MultiViewBackbone
 from models.alignment import CrossModalAlignment
@@ -24,10 +26,11 @@ from classification.report_labeler import ReportClassifier
 from rag.hybrid_generator import HybridReportGenerator
 from rag.verifier import ReportVerifier
 
-nltk.download("wordnet")
+nltk.download("wordnet", quiet=True)
+nltk.download("omw-1.4",  quiet=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ROOT = os.environ.get("IU_XRAY_ROOT", "C:/Datasets/IU_Xray")
+ROOT = Config.DATA_ROOT
 
 # ------------------------------------------------
 # LOAD TEST DATA
@@ -99,12 +102,20 @@ verifier = ReportVerifier(alignment=alignment, min_score=0.0)
 # METRICS
 # ------------------------------------------------
 smooth = SmoothingFunction().method1
-rouge = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+rouge  = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
 
-bleu1, bleu2, bleu3, bleu4 = [], [], [], []
-meteor_scores = []
+# Corpus-level accumulation (correct way to report BLEU for NLG papers)
+all_references  = []   # list of list[list[str]]  (per sample: [[ref_tokens]])
+all_hypotheses  = []   # list of list[str]          (per sample: hyp_tokens)
+
+meteor_scores  = []
+rouge1_scores  = []
+rouge2_scores  = []
 rouge_l_scores = []
-verify_scores = []
+verify_scores  = []
+
+# Keep generated texts for qualitative analysis
+generated_reports_log = []
 
 print("Evaluating Aligned Hybrid Pipeline...")
 
@@ -125,6 +136,7 @@ with torch.no_grad():
         global_feat = visual_features.flatten(2).mean(dim=2)
         img_emb = proj_img(global_feat)
         img_np = img_emb.cpu().numpy().astype("float32")
+        faiss.normalize_L2(img_np)          # match IndexFlatIP index
         D, I = index.search(img_np, k=5)
 
         candidate_reports = [train_metadata[int(i)]["report"] for i in I[0]]
@@ -174,40 +186,62 @@ with torch.no_grad():
         ref_tokens = reference.split()
         gen_tokens = generated.split()
 
-        bleu1.append(sentence_bleu([ref_tokens], gen_tokens,
-                                   weights=(1,0,0,0),
-                                   smoothing_function=smooth))
+        # Accumulate for corpus-level BLEU (standard in report generation papers)
+        all_references.append([ref_tokens])
+        all_hypotheses.append(gen_tokens)
 
-        bleu2.append(sentence_bleu([ref_tokens], gen_tokens,
-                                   weights=(0.5,0.5,0,0),
-                                   smoothing_function=smooth))
-
-        bleu3.append(sentence_bleu([ref_tokens], gen_tokens,
-                                   weights=(0.33,0.33,0.33,0),
-                                   smoothing_function=smooth))
-
-        bleu4.append(sentence_bleu([ref_tokens], gen_tokens,
-                                   weights=(0.25,0.25,0.25,0.25),
-                                   smoothing_function=smooth))
-
+        # Sentence-level METEOR (standard: word-level tokens)
         meteor_scores.append(meteor_score([ref_tokens], gen_tokens))
 
-        rouge_l_scores.append(
-            rouge.score(reference, generated)['rougeL'].fmeasure
-        )
+        rouge_out = rouge.score(reference, generated)
+        rouge1_scores.append(rouge_out['rouge1'].fmeasure)
+        rouge2_scores.append(rouge_out['rouge2'].fmeasure)
+        rouge_l_scores.append(rouge_out['rougeL'].fmeasure)
+
+        generated_reports_log.append({
+            "reference": reference,
+            "generated": generated,
+            "verify_score": float(verify_score),
+        })
 
 # ------------------------------------------------
 # FINAL RESULTS
 # ------------------------------------------------
-print("\n==== FINAL RESULTS ====")
-print(f"BLEU-1 : {np.mean(bleu1):.4f}")
-print(f"BLEU-2 : {np.mean(bleu2):.4f}")
-print(f"BLEU-3 : {np.mean(bleu3):.4f}")
-print(f"BLEU-4 : {np.mean(bleu4):.4f}")
-print(f"METEOR : {np.mean(meteor_scores):.4f}")
-print(f"ROUGE-L: {np.mean(rouge_l_scores):.4f}")
-print(f"\n==== VERIFICATION SCORES ====")
-print(f"Mean   : {np.mean(verify_scores):.4f}")
-print(f"Median : {np.median(verify_scores):.4f}")
-print(f"Min    : {np.min(verify_scores):.4f}")
-print(f"Max    : {np.max(verify_scores):.4f}")
+# Corpus-level BLEU: correct for NLG evaluation
+# (averaging sentence BLEU per sample inflates scores)
+bleu1_c = corpus_bleu(all_references, all_hypotheses, weights=(1, 0, 0, 0))
+bleu2_c = corpus_bleu(all_references, all_hypotheses, weights=(0.5, 0.5, 0, 0))
+bleu3_c = corpus_bleu(all_references, all_hypotheses, weights=(1/3, 1/3, 1/3, 0))
+bleu4_c = corpus_bleu(all_references, all_hypotheses, weights=(0.25, 0.25, 0.25, 0.25))
+
+results = {
+    "BLEU-1":  round(bleu1_c, 4),
+    "BLEU-2":  round(bleu2_c, 4),
+    "BLEU-3":  round(bleu3_c, 4),
+    "BLEU-4":  round(bleu4_c, 4),
+    "METEOR":  round(float(np.mean(meteor_scores)), 4),
+    "ROUGE-1": round(float(np.mean(rouge1_scores)), 4),
+    "ROUGE-2": round(float(np.mean(rouge2_scores)), 4),
+    "ROUGE-L": round(float(np.mean(rouge_l_scores)), 4),
+    "verify_score_mean":   round(float(np.mean(verify_scores)),   4),
+    "verify_score_median": round(float(np.median(verify_scores)), 4),
+    "num_samples": len(all_hypotheses),
+}
+
+print("\n==== FINAL RESULTS (corpus-level) ====")
+for k, v in results.items():
+    print(f"  {k:<24}: {v}")
+
+# Save results and generated reports to disk
+out_dir   = os.path.join(_ROOT, "results")
+os.makedirs(out_dir, exist_ok=True)
+
+results_path = os.path.join(out_dir, "metrics.json")
+with open(results_path, "w", encoding="utf-8") as f:
+    json.dump(results, f, indent=2)
+print(f"\nMetrics saved -> {results_path}")
+
+reports_path = os.path.join(out_dir, "generated_reports.json")
+with open(reports_path, "w", encoding="utf-8") as f:
+    json.dump(generated_reports_log, f, indent=2, ensure_ascii=False)
+print(f"Generated reports saved -> {reports_path}")

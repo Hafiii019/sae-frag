@@ -1,0 +1,13 @@
+{
+  "BLEU-1": 0.3188,
+  "BLEU-2": 0.1872,
+  "BLEU-3": 0.1191,
+  "BLEU-4": 0.0738,
+  "METEOR": 0.2742,
+  "ROUGE-1": 0.4232,
+  "ROUGE-2": 0.1578,
+  "ROUGE-L": 0.3035,
+  "verify_score_mean": 0.0352,
+  "verify_score_median": 0.0294,
+  "num_samples": 771
+}
