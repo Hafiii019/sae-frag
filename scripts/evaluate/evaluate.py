@@ -164,10 +164,8 @@ with torch.no_grad():
         # 6. Soft-AND fact verification
         verified_entities = img_entities * rep_entities
 
-        prompt = [
-            "Generate a detailed radiology report based on the chest X-ray regions, "
-            "verified clinical findings, and retrieved context."
-        ]
+        # Entity-informed prompt matches train_stage3.py exactly.
+        prompt = HybridReportGenerator.build_entity_prompt(verified_entities.cpu())
 
         # 7. Generate report
         #    aligned_features  → region-aligned visual tokens

@@ -27,6 +27,7 @@ import logging
 from typing import List, Tuple
 
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +88,13 @@ class ReportVerifier:
         if not report.strip():
             return 0.0
 
-        _, _, attn_weights = self.alignment(
-            image_features, [report]
-        )  # attn_weights: (1, 49, L)
-
-        return float(attn_weights.mean().item())
+        aligned, cls_token, _ = self.alignment(image_features, [report])
+        # Cosine similarity between global image embedding and text CLS token.
+        # Produces scores in [-1, 1] — far more discriminative than mean
+        # attention weight (~0.035 uniform baseline from old implementation).
+        img_global = F.normalize(aligned.mean(dim=1), dim=-1)  # (1, 256)
+        txt_global = F.normalize(cls_token,           dim=-1)  # (1, 256)
+        return float(F.cosine_similarity(img_global, txt_global).item())
 
     @torch.no_grad()
     def verify(

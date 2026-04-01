@@ -46,7 +46,7 @@ DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP      = DEVICE.type == "cuda"
 NUM_EPOCHS   = 50
 BATCH_SIZE   = 8
-ACCUM_STEPS  = 2           # effective batch = 16
+ACCUM_STEPS  = 4           # effective batch = 32
 WARMUP_STEPS = 200
 LR_T5        = 1e-5
 LR_NEW       = 5e-5
@@ -146,7 +146,7 @@ if not _loaded:
 
 
 # ── Optimizer & scheduler ─────────────────────────────────────────────────
-_new_layers = {"visual_proj", "visual_norm", "visual_drop", "entity_embed"}
+_new_layers = {"visual_proj", "visual_norm", "visual_drop", "entity_proj"}
 t5_params   = [p for n, p in generator.named_parameters()
                if not any(k in n for k in _new_layers) and p.requires_grad]
 new_params  = [p for n, p in generator.named_parameters()
@@ -197,9 +197,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         aligned_features = aligned_features.to(DEVICE)
         entity_vector    = entity_vector.to(DEVICE)
 
-        prompts = [
-            "Generate a detailed radiology report for the chest X-ray."
-        ] * len(reports)
+        # Entity-informed prompt: tells the decoder which pathologies to mention.
+        # Dynamically built per-sample from the cached soft-AND entity vector.
+        # Matching train and eval prompts is critical for seq2seq performance.
+        prompts = HybridReportGenerator.build_entity_prompt(entity_vector.cpu())
 
         # BFloat16 AMP — same exponent range as FP32, no NaN risk
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP, dtype=torch.bfloat16):

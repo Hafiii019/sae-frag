@@ -5,6 +5,16 @@ from transformers import T5ForConditionalGeneration, T5Tokenizer
 
 class HybridReportGenerator(nn.Module):
 
+    # Number of entity conditioning tokens fed into the encoder.
+    # 4 tokens give the T5 decoder 4× more entity context slots vs 1.
+    N_ENTITY_TOKENS = 4
+
+    CLASS_NAMES = [
+        "No Finding", "Cardiomegaly", "Pleural Effusion", "Pneumonia",
+        "Pneumothorax", "Atelectasis", "Consolidation", "Edema",
+        "Emphysema", "Fibrosis", "Nodule", "Mass", "Hernia", "Infiltrate",
+    ]
+
     def __init__(self, num_entities=14, model_name="google/flan-t5-base"):
         super().__init__()
 
@@ -18,10 +28,53 @@ class HybridReportGenerator(nn.Module):
         self.visual_proj = nn.Linear(256, d_model)
         self.visual_drop = nn.Dropout(0.1)
 
-        # Entity embedding: learned embedding per pathology class.
-        # Used as a soft-weighted sum (NOT boolean selection) so that soft-AND
-        # probabilities are always meaningful — even small values contribute.
-        self.entity_embed = nn.Embedding(num_entities, d_model)
+        # Entity projection: 2-layer MLP that maps the 14-class soft-AND vector
+        # into N_ENTITY_TOKENS dense tokens.  An MLP learns richer non-linear
+        # combinations of entity probabilities than a weighted embedding table.
+        self.n_entity_tokens = self.N_ENTITY_TOKENS
+        self.entity_proj = nn.Sequential(
+            nn.Linear(num_entities, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, self.n_entity_tokens * d_model),
+        )
+
+    @staticmethod
+    def build_entity_prompt(
+        entity_vector: "torch.Tensor",
+        threshold: float = 0.25,
+    ) -> "list[str]":
+        """Build entity-informed prompts from soft entity probability vectors.
+
+        Parameters
+        ----------
+        entity_vector : Tensor of shape (B, 14) — soft-AND entity probabilities.
+        threshold     : Minimum probability to include an entity in the prompt.
+
+        Returns
+        -------
+        list[str] of length B, one per sample.
+        """
+        names = HybridReportGenerator.CLASS_NAMES
+        prompts = []
+        for ev in entity_vector:
+            # Skip index 0 ("No Finding") — it's the absence class
+            present = [
+                names[i] for i, p in enumerate(ev.tolist())
+                if i > 0 and p >= threshold
+            ]
+            if present:
+                findings = ", ".join(present)
+                prompt = (
+                    f"Generate radiology findings and impression. "
+                    f"Detected: {findings}. Use the retrieved report context."
+                )
+            else:
+                prompt = (
+                    "Generate radiology findings and impression. "
+                    "No significant findings detected. Use the retrieved report context."
+                )
+            prompts.append(prompt)
+        return prompts
 
     def forward(
         self,
@@ -45,26 +98,17 @@ class HybridReportGenerator(nn.Module):
         visual_mask = torch.ones(B, visual_tokens.size(1), device=device)
 
         # ======================================================
-        # 2️⃣ Entity Token  (soft-weighted sum → 1 token per sample)
+        # 2️⃣ Entity Tokens  (MLP → N_ENTITY_TOKENS tokens per sample)
         # ------------------------------------------------------
         # entity_vector is a [0,1] probability vector (B, 14) from soft-AND
         # of image-classifier and report-classifier sigmoid outputs.
-        # We compute a probability-weighted combination of the 14 learned
-        # entity embeddings, producing ONE compact token per sample.
-        # This is always well-defined (no boolean thresholding) and fully
-        # differentiable, so gradients flow back through entity weights.
+        # A 2-layer MLP projects the full entity distribution into 4 dense
+        # tokens, giving the decoder 4× more entity conditioning capacity.
         # ======================================================
-        entity_ids = torch.arange(
-            entity_vector.size(1), device=device
-        )                                                           # (14,)
-        all_entity_embs = self.entity_embed(entity_ids)             # (14, d_model)
-
-        # entity_vector: (B, 14), all_entity_embs: (14, d_model)
-        # → weighted sum: (B, d_model) → unsqueeze → (B, 1, d_model)
-        entity_token = torch.matmul(
-            entity_vector.float(), all_entity_embs
-        ).unsqueeze(1)                                              # (B, 1, d_model)
-        entity_mask = torch.ones(B, 1, device=device)
+        entity_tokens = self.entity_proj(entity_vector.float()).view(
+            B, self.n_entity_tokens, -1
+        )                                                           # (B, 4, d_model)
+        entity_mask = torch.ones(B, self.n_entity_tokens, device=device)
 
         # ======================================================
         # 3️⃣ Retrieved Text Tokens
@@ -104,7 +148,7 @@ class HybridReportGenerator(nn.Module):
         # Order: visual regions | entity context | retrieved report | instruction
         # ======================================================
         encoder_inputs = torch.cat(
-            [visual_tokens, entity_token, retrieved_embeds, prompt_embeds],
+            [visual_tokens, entity_tokens, retrieved_embeds, prompt_embeds],
             dim=1
         )
 
@@ -155,12 +199,12 @@ class HybridReportGenerator(nn.Module):
             generated_ids = self.t5.generate(
                 inputs_embeds=encoder_inputs,
                 attention_mask=attention_mask,
-                max_new_tokens=300,
-                num_beams=8,
-                length_penalty=1.5,
+                max_new_tokens=150,      # IU X-Ray refs avg ~55 tokens; 300 over-generates
+                num_beams=6,
+                length_penalty=1.0,     # was 1.5 — over-generation hurts BLEU-4 precision
                 no_repeat_ngram_size=3,
                 repetition_penalty=1.3,
-                min_length=40,
+                min_length=30,
                 early_stopping=True,
             )
 
