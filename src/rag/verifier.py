@@ -74,27 +74,52 @@ class ReportVerifier:
         Parameters
         ----------
         image_features:
-            Shape ``(1, 256, 7, 7)`` — single-sample batch.
+            Shape ``(1, 256, H, W)`` — single-sample batch.
         report:
             Candidate radiology report text.
 
         Returns
         -------
-        float
-            Mean cross-modal attention weight in ``[0, 1]``.  Higher means
-            the image patches attend more strongly to this report's tokens,
-            indicating better clinical alignment.
+        float  cosine similarity between pooled image and text embeddings.
         """
         if not report.strip():
             return 0.0
-
         aligned, cls_token, _ = self.alignment(image_features, [report])
-        # Cosine similarity between global image embedding and text CLS token.
-        # Produces scores in [-1, 1] — far more discriminative than mean
-        # attention weight (~0.035 uniform baseline from old implementation).
-        img_global = F.normalize(aligned.mean(dim=1), dim=-1)  # (1, 256)
-        txt_global = F.normalize(cls_token,           dim=-1)  # (1, 256)
+        img_global = F.normalize(aligned.mean(dim=1), dim=-1)
+        txt_global = F.normalize(cls_token,           dim=-1)
         return float(F.cosine_similarity(img_global, txt_global).item())
+
+    @torch.no_grad()
+    def score_batch(
+        self,
+        image_features: torch.Tensor,
+        candidate_reports: List[str],
+    ) -> List[float]:
+        """Score all candidates in a single forward pass (faster than calling
+        ``score()`` in a loop when ``top_k > 1``).
+
+        Parameters
+        ----------
+        image_features:
+            Shape ``(1, 256, H, W)`` — single-sample batch.
+        candidate_reports:
+            List of candidate report strings.
+
+        Returns
+        -------
+        list[float]  one cosine-similarity score per candidate.
+        """
+        k = len(candidate_reports)
+        if k == 0:
+            return []
+
+        # Tile the single image feature to match the number of candidates
+        tiled = image_features.expand(k, -1, -1, -1)              # (k, 256, H, W)
+        aligned, cls_tokens, _ = self.alignment(tiled, candidate_reports)
+        img_globals = F.normalize(aligned.mean(dim=1), dim=-1)     # (k, 256)
+        txt_globals = F.normalize(cls_tokens,           dim=-1)    # (k, 256)
+        sims = F.cosine_similarity(img_globals, txt_globals)       # (k,)
+        return sims.tolist()
 
     @torch.no_grad()
     def verify(
@@ -112,7 +137,7 @@ class ReportVerifier:
         Parameters
         ----------
         image_features:
-            Shape ``(1, 256, 7, 7)`` — single-sample batch.
+            Shape ``(1, 256, 14, 14)`` — single-sample batch (P4 resolution).
         candidate_reports:
             Ordered list of FAISS-retrieved report strings (rank-1 first).
 
@@ -135,9 +160,8 @@ class ReportVerifier:
             s = self.score(image_features, candidate_reports[0])
             return candidate_reports[0], s
 
-        scores: List[float] = [
-            self.score(image_features, r) for r in candidate_reports
-        ]
+        # Batch all candidates in one forward pass
+        scores: List[float] = self.score_batch(image_features, candidate_reports)
 
         for i, s in enumerate(scores):
             logger.debug("Candidate %d  score=%.4f", i, s)

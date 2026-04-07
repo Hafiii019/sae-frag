@@ -84,10 +84,23 @@ class IUXrayMultiViewDataset(Dataset):
         # ------------------------
         # Image transforms
         # Train uses augmentation; val/test use deterministic resize only.
-        # Conservative augmentations chosen for medical imaging:
-        #  - No horizontal flip (flipping changes cardiac/aortic anatomy)
-        #  - Small rotation (patient positioning ±10°)
-        #  - Slight colour jitter (scanner/contrast variation)
+        #
+        # CXR-safe augmentation rules:
+        #  ✗ No horizontal flip  — left/right heart position is diagnostic
+        #  ✗ No vertical flip    — lung anatomy is orientation-dependent
+        #  ✗ No large rotation   — > 15° not realistic for real acquisitions
+        #  ✓ RandomResizedCrop   — patient distance / zoom variation
+        #  ✓ Small rotation      — patient positioning on the table
+        #  ✓ Brightness/contrast — scanner exposure variation
+        #  ✓ GaussianBlur        — different scanner sharpness / motion blur
+        #  ✓ RandomAdjustSharpness — detail emphasis variation
+        #  ✓ RandomEqualize      — global histogram / CLAHE-like normalisation
+        #  ✓ RandomErasing       — occlusion robustness (foreign objects, wires)
+        #
+        # Each view (frontal, lateral) gets the transform applied independently
+        # with different random seeds, so the two views in a pair always receive
+        # a different random augmentation — giving SimCLR-style contrastive pairs
+        # at zero extra cost.
         # ------------------------
         _norm = transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -96,11 +109,28 @@ class IUXrayMultiViewDataset(Dataset):
 
         if split == "train":
             self.transform = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
-                transforms.RandomRotation(degrees=10),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                # Geometry — simulate patient positioning and zoom
+                transforms.RandomResizedCrop(224, scale=(0.75, 1.0), ratio=(0.9, 1.1)),
+                transforms.RandomRotation(degrees=15),
+                transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+
+                # Intensity — simulate scanner and exposure variation
+                transforms.ColorJitter(brightness=0.3, contrast=0.3),
+                transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.3),
+                transforms.RandomEqualize(p=0.2),  # CLAHE-like global contrast
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))],
+                    p=0.3,
+                ),
+
+                # Convert to tensor before pixel-level augmentations
                 transforms.ToTensor(),
                 _norm,
+
+                # Occlusion — simulate wires, tubes, foreign objects
+                transforms.RandomErasing(
+                    p=0.2, scale=(0.02, 0.08), ratio=(0.3, 3.0), value=0
+                ),
             ])
         else:
             self.transform = transforms.Compose([

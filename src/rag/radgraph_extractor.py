@@ -268,10 +268,15 @@ class RadGraphExtractor:
             self._model = RadGraph(reward_level="partial")
             logger.info("RadGraph model loaded (device=%s).", self.device)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "RadGraph unavailable (%s).  Using keyword-matching fallback.",
-                exc,
+            import warnings
+            warnings.warn(
+                f"RadGraph unavailable ({exc}).\n"
+                "Falling back to keyword-based entity extraction.\n"
+                "This affects evaluate.py Entity F1 scores — results will be approximate.\n"
+                "To fix: pip install radgraph  (requires transformers < 4.40)",
+                stacklevel=2,
             )
+            logger.warning("RadGraph unavailable (%s). Using keyword fallback.", exc)
             self._use_radgraph = False
 
     def _radgraph_extract(self, report: str) -> dict:

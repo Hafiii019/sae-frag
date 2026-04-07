@@ -14,20 +14,25 @@ Stage 2 – Entity Classifiers
   SAEImageClassifier   – predicts 14 CheXpert findings from image features
   ReportClassifier     – predicts 14 CheXpert findings from report text
 
-Stage 3 – Hybrid Report Generator
-  FAISS retrieval → top-k candidate reports
-  ReportVerifier  → re-ranks by cross-modal attention score
-  HybridReportGenerator (flan-t5-base) → final report
+Stage 3 (FactMM-RAG) – Fact-Aware Retrieval + Hybrid Report Generator
+  Factual Pair Mining  → F1RadGraph similarity (Jain et al., 2021)
+  Factual Retriever    → InfoNCE training on (image query, image+text document) pairs
+  FAISS retrieval      → top-k factually-similar candidate reports
+  ReportVerifier       → cross-modal attention re-ranking
+  HybridReportGenerator (flan-t5-large) → final report
 ```
 
 ## Results (IU X-Ray test set)
 
-| Metric   | Score  |
-|----------|--------|
-| BLEU-1   | 0.256  |
-| BLEU-4   | 0.057  |
-| METEOR   | 0.235  |
-| ROUGE-L  | 0.277  |
+| Metric                    | Score  |
+|---------------------------|--------|
+| BLEU-1                    | 0.294  |
+| BLEU-4                    | 0.085  |
+| METEOR                    | 0.273  |
+| ROUGE-L                   | 0.319  |
+| **CheXBert F1 (micro)**   | —      |
+| **CheXBert F1 (macro)**   | —      |
+| **Entity F1**             | —      |
 
 ## Project Structure
 
@@ -117,16 +122,26 @@ Trains `SAEImageClassifier` from pseudo-labels produced by `ReportClassifier`.
 Requires `checkpoints/stage2/report_classifier.pth` to already exist.  
 Saves `image_classifier.pth` to `checkpoints/stage2/`.
 
-### Stage 3 – Report Generator
+### Stage 3 – Fact-Aware Retriever + Report Generator (FactMM-RAG)
 
 ```bash
-# Step 1: Build FAISS retrieval index (once)
+# Step 1: Mine factually-informed positive report pairs (once, ~20 min)
+#         Uses F1RadGraph entity-overlap similarity (Jain et al., 2021)
+#         Output: store/factual_pairs.pkl
+python scripts/prepare/mine_factual_pairs.py
+
+# Step 2: Train the fact-aware multimodal retriever (FactMM-RAG, NAACL 2025)
+#         InfoNCE loss: query=image, positive=(image+text) of factual pair
+#         Output: checkpoints/stage1/factual_retriever.pth
+python scripts/train/train_factual_retriever.py
+
+# Step 3: Rebuild FAISS index using document encoder (image+text embeddings)
 python scripts/prepare/build_index.py
 
-# Step 2: Pre-compute and cache frozen model outputs (once, ~60-90 min)
+# Step 4: Pre-compute and cache frozen model outputs (once, ~60-90 min)
 python scripts/prepare/cache_features.py
 
-# Step 3: Train generator
+# Step 5: Train hybrid report generator
 python scripts/train/train_stage3.py
 
 # Resume after interrupt
@@ -134,6 +149,10 @@ python scripts/train/train_stage3.py --resume
 ```
 
 Saves checkpoints to `checkpoints/stage3/`.
+
+> **Note**: Steps 1–2 implement the FactMM-RAG retriever training. If you skip
+> them, build_index.py and cache_features.py fall back to the plain Stage-1
+> image encoder (original behaviour).
 
 ## Evaluation
 

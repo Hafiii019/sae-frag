@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from models.multiview_backbone import MultiViewBackbone
+from models import MultiViewBackbone
 
 
 class SAEImageClassifier(nn.Module):

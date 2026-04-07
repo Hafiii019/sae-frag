@@ -1,6 +1,12 @@
+# ── Standard library ──────────────────────────────────────────────────────
+import logging
+
+# ── Third-party ───────────────────────────────────────────────────────────
 import torch
 import torch.nn as nn
 from transformers import T5ForConditionalGeneration, T5Tokenizer
+
+log = logging.getLogger(__name__)
 
 
 class HybridReportGenerator(nn.Module):
@@ -15,7 +21,7 @@ class HybridReportGenerator(nn.Module):
         "Emphysema", "Fibrosis", "Nodule", "Mass", "Hernia", "Infiltrate",
     ]
 
-    def __init__(self, num_entities=14, model_name="google/flan-t5-base"):
+    def __init__(self, num_entities=14, model_name="google/flan-t5-large"):
         super().__init__()
 
         self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
@@ -45,6 +51,13 @@ class HybridReportGenerator(nn.Module):
     ) -> "list[str]":
         """Build entity-informed prompts from soft entity probability vectors.
 
+        Follows the FactMM-RAG (NAACL 2025) RAG prompt template:
+            "Here is a report of a related patient: '<retrieved_report>'
+             Generate a radiology report from this image: <image>"
+
+        The entity-aware prefix is prepended to give the T5 decoder
+        additional diagnostic grounding beyond the retrieved report text.
+
         Parameters
         ----------
         entity_vector : Tensor of shape (B, 14) — soft-AND entity probabilities.
@@ -65,20 +78,40 @@ class HybridReportGenerator(nn.Module):
             if present:
                 findings = ", ".join(present)
                 prompt = (
-                    f"Generate radiology findings and impression. "
-                    f"Detected: {findings}. Use the retrieved report context."
+                    f"Detected findings: {findings}. "
+                    "Generate a radiology report from this image:"
                 )
             else:
-                prompt = (
-                    "Generate radiology findings and impression. "
-                    "No significant findings detected. Use the retrieved report context."
-                )
+                prompt = "Generate a radiology report from this image:"
             prompts.append(prompt)
         return prompts
 
+    @staticmethod
+    def build_rag_retrieved_text(retrieved_texts: "list[str]") -> "list[str]":
+        """Wrap retrieved reports in the FactMM-RAG prompt template.
+
+        From Appendix A.2 of the paper:
+            "Here is a report of a related patient: '<document>'"
+
+        This is prepended to the image instruction so the T5 encoder sees
+        the retrieved context before the generation directive.
+
+        Parameters
+        ----------
+        retrieved_texts : list[str] of length B — rank-1 retrieved reports.
+
+        Returns
+        -------
+        list[str] of length B — wrapped report strings fed to the encoder.
+        """
+        return [
+            f"Here is a report of a related patient: \"{t}\""
+            for t in retrieved_texts
+        ]
+
     def forward(
         self,
-        region_features,     # (B, 49, 256)
+        region_features,     # (B, 196, 256)  — 14×14 P4 tokens
         entity_vector,       # (B, 14)
         retrieved_texts,     # list[str]
         prompt_texts,        # list[str]
@@ -88,80 +121,50 @@ class HybridReportGenerator(nn.Module):
         device = region_features.device
         B = region_features.size(0)
 
-        # ======================================================
-        # 1️⃣ Visual Tokens  (LayerNorm → Linear → Dropout)
-        # ======================================================
-        region_normed = self.visual_norm(region_features)           # (B, 49, 256)
+        # ── 1. Visual tokens: LayerNorm → Linear → Dropout ───────────────────
+        region_normed = self.visual_norm(region_features)           # (B, 196, 256)
         visual_tokens = self.visual_drop(
             self.visual_proj(region_normed)
-        )                                                           # (B, 49, d_model)
+        )                                                           # (B, 196, d_model)
         visual_mask = torch.ones(B, visual_tokens.size(1), device=device)
 
-        # ======================================================
-        # 2️⃣ Entity Tokens  (MLP → N_ENTITY_TOKENS tokens per sample)
-        # ------------------------------------------------------
-        # entity_vector is a [0,1] probability vector (B, 14) from soft-AND
-        # of image-classifier and report-classifier sigmoid outputs.
-        # A 2-layer MLP projects the full entity distribution into 4 dense
-        # tokens, giving the decoder 4× more entity conditioning capacity.
-        # ======================================================
+        # ── 2. Entity tokens: 2-layer MLP → N_ENTITY_TOKENS dense tokens ─────
         entity_tokens = self.entity_proj(entity_vector.float()).view(
             B, self.n_entity_tokens, -1
         )                                                           # (B, 4, d_model)
         entity_mask = torch.ones(B, self.n_entity_tokens, device=device)
 
-        # ======================================================
-        # 3️⃣ Retrieved Text Tokens
-        # ======================================================
+        # ── 3. Retrieved text tokens ──────────────────────────────────────────
         retrieved_enc = self.tokenizer(
             retrieved_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=256
+            max_length=384,
         ).to(device)
+        retrieved_embeds = self.t5.encoder.embed_tokens(retrieved_enc.input_ids)
+        retrieved_mask   = retrieved_enc.attention_mask
 
-        retrieved_embeds = self.t5.encoder.embed_tokens(
-            retrieved_enc.input_ids
-        )
-
-        retrieved_mask = retrieved_enc.attention_mask
-
-        # ======================================================
-        # 4️⃣ Prompt Tokens
-        # ======================================================
+        # ── 4. Prompt tokens ──────────────────────────────────────────────────
         prompt_enc = self.tokenizer(
             prompt_texts,
             return_tensors="pt",
             padding=True,
-            truncation=True
+            truncation=True,
         ).to(device)
+        prompt_embeds = self.t5.encoder.embed_tokens(prompt_enc.input_ids)
+        prompt_mask   = prompt_enc.attention_mask
 
-        prompt_embeds = self.t5.encoder.embed_tokens(
-            prompt_enc.input_ids
-        )
-
-        prompt_mask = prompt_enc.attention_mask
-
-        # ======================================================
-        # 5️⃣ Concatenate Everything
-        # Order: visual regions | entity context | retrieved report | instruction
-        # ======================================================
+        # ── 5. Concatenate: visual | entity | retrieved | prompt ──────────────
         encoder_inputs = torch.cat(
-            [visual_tokens, entity_tokens, retrieved_embeds, prompt_embeds],
-            dim=1
+            [visual_tokens, entity_tokens, retrieved_embeds, prompt_embeds], dim=1
         )
-
         attention_mask = torch.cat(
-            [visual_mask, entity_mask, retrieved_mask, prompt_mask],
-            dim=1
+            [visual_mask, entity_mask, retrieved_mask, prompt_mask], dim=1
         )
 
-        # ======================================================
-        # 6️⃣ Training Mode
-        # ======================================================
+        # ── 6. Training ───────────────────────────────────────────────────────
         if target_texts is not None:
-
             target_enc = self.tokenizer(
                 target_texts,
                 return_tensors="pt",
@@ -170,7 +173,6 @@ class HybridReportGenerator(nn.Module):
                 max_length=512,
             ).to(device)
 
-            # Replace padding token ids with -100 so they are ignored by CE loss
             labels = target_enc.input_ids.clone()
             labels[labels == self.tokenizer.pad_token_id] = -100
 
@@ -180,35 +182,26 @@ class HybridReportGenerator(nn.Module):
                 labels=labels,
             )
 
-            # Label smoothing: reduces overconfident predictions, improves BLEU/ROUGE
             loss = outputs.loss
             if self.training:
-                log_probs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
+                log_probs  = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
                 smooth_loss = -log_probs.mean(dim=-1)
-                mask = (labels != -100).float()
+                mask        = (labels != -100).float()
                 smooth_loss = (smooth_loss * mask).sum() / mask.sum()
-                loss = 0.9 * loss + 0.1 * smooth_loss
+                loss        = 0.9 * loss + 0.1 * smooth_loss
 
             return loss
 
-        # ======================================================
-        # 7️⃣ Inference Mode
-        # ======================================================
-        else:
-
-            generated_ids = self.t5.generate(
-                inputs_embeds=encoder_inputs,
-                attention_mask=attention_mask,
-                max_new_tokens=150,      # IU X-Ray refs avg ~55 tokens; 300 over-generates
-                num_beams=6,
-                length_penalty=1.0,     # was 1.5 — over-generation hurts BLEU-4 precision
-                no_repeat_ngram_size=3,
-                repetition_penalty=1.3,
-                min_length=30,
-                early_stopping=True,
-            )
-
-            return self.tokenizer.batch_decode(
-                generated_ids,
-                skip_special_tokens=True
-            )
+        # ── 7. Inference ──────────────────────────────────────────────────────
+        generated_ids = self.t5.generate(
+            inputs_embeds=encoder_inputs,
+            attention_mask=attention_mask,
+            max_new_tokens=100,
+            num_beams=6,
+            length_penalty=0.8,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.3,
+            min_length=20,
+            early_stopping=True,
+        )
+        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
