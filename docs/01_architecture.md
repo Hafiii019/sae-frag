@@ -85,7 +85,7 @@
 
 ## Component Breakdown
 
-### Visual Backbone (SAEnet)
+### Visual Backbone (SAENet)
 
 ```
 Input: (B, 2, 3, 224, 224)  — two views per patient
@@ -96,24 +96,64 @@ Input: (B, 2, 3, 224, 224)  — two views per patient
          │                        P2, P3, P4, P5
          │                             │
          │                           SAFE
-         │                 C5 (query) ←→ P5 (key/value)
-         │                        enhanced_1
+         │           C5 (query) ←→ P3 (key/value, 28×28)
+         │                        enhanced_1: (B, 256, 28, 28)
          │
-         └── View 2 → (same path) → enhanced_2
+         └── View 2 → (same path) → enhanced_2: (B, 256, 28, 28)
                                          │
-                              fused = (enhanced_1 + enhanced_2) / 2
-                              Output: (B, 256, 7, 7)
+                   Additive fusion: feat1 + feat2  (SAENet eq.5)
+                   Output: (B, 256, 28, 28)  → 784 spatial tokens
+```
+
+**SAFE uses P3 (28×28)** for 4× finer spatial detail than P4 (14×14), staying
+within 6 GB VRAM (P2 at 56×56=3136 tokens would overflow). Additive dual-view
+fusion matches SAENet eq.5 — both views contribute equally.
+Input: (B, 2, 3, 224, 224)  — two views per patient
+         │
+         ├── View 1 → ResNet101 → C2, C3, C4, C5
+         │                             │
+         │                            FPN
+         │                        P2, P3, P4, P5
+         │                             │
+         │                           SAFE
+         │           C5 (query) ←→ P3 (key/value, 28×28)
+         │                        enhanced_1: (B, 256, 28, 28)
+         │
+         └── View 2 → (same path) → enhanced_2: (B, 256, 28, 28)
+                                         │
+                   Additive fusion: feat1 + feat2  (SAENet eq.5)
+                   Output: (B, 256, 28, 28)  → 784 spatial tokens
+```
+
+**SAFE uses P3 (28×28)** for 4× finer spatial detail than P4 (14×14), staying
+within 6 GB VRAM (P2 at 56×56=3136 tokens would overflow). Additive dual-view
+fusion matches SAENet eq.5 — both views contribute equally.
+Input: (B, 2, 3, 224, 224)  — two views per patient
+         │
+         ├── View 1 → ResNet101 → C2, C3, C4, C5
+         │                             │
+         │                            FPN
+         │                        P2, P3, P4, P5
+         │                             │
+         │                           SAFE
+         │           C5 (query) ←→ P3 (key/value, 28×28)
+         │                        enhanced_1: (B, 256, 28, 28)
+         │
+         └── View 2 → (same path) → enhanced_2: (B, 256, 28, 28)
+                                         │
+                   Additive fusion: feat1 + feat2  (SAENet eq.5)
+                   Output: (B, 256, 28, 28)  → 784 spatial tokens
 ```
 
 ### CrossModalAlignment
 
 ```
 Input:
-  image_features: (B, 256, 7, 7)
+  image_features: (B, 256, 28, 28)  — P3 resolution after SAFE
   reports: list[str]
 
 Steps:
-  img_tokens  = flatten+transpose → (B, 49, 256)
+  img_tokens  = flatten+transpose → (B, 784, 256)
   text_tokens = ClinicalBERT(reports) → (B, L, 768)
               → linear projection   → (B, L, 256)
   cls_token   = text_tokens[:, 0]   → (B, 256)
@@ -125,9 +165,9 @@ Steps:
   )
 
 Output:
-  aligned_features: (B, 49, 256)   ← regions shaped by text
+  aligned_features: (B, 784, 256)  ← regions shaped by text
   cls_token:        (B, 256)        ← global text summary
-  attn_weights:     (B, 49, L)      ← token-to-region map
+  attn_weights:     (B, 784, L)     ← token-to-region map
 ```
 
 ### HybridReportGenerator (Flan-T5)

@@ -14,7 +14,7 @@ class ReportClassifier(nn.Module):
 
         self.encoder = AutoModel.from_pretrained(
             "emilyalsentzer/Bio_ClinicalBERT",
-            use_safetensors=True
+            torch_dtype="auto"
         )
 
         hidden_dim = 768

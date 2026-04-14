@@ -4,7 +4,8 @@ import logging
 # ── Third-party ───────────────────────────────────────────────────────────
 import torch
 import torch.nn as nn
-from transformers import T5ForConditionalGeneration, T5Tokenizer
+import torch.nn.functional as F
+from transformers import AutoTokenizer, T5ForConditionalGeneration
 
 log = logging.getLogger(__name__)
 
@@ -21,11 +22,14 @@ class HybridReportGenerator(nn.Module):
         "Emphysema", "Fibrosis", "Nodule", "Mass", "Hernia", "Infiltrate",
     ]
 
-    def __init__(self, num_entities=14, model_name="google/flan-t5-large"):
+    def __init__(self, num_entities=14, model_name="google/flan-t5-base"):
         super().__init__()
 
         self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
+        # Enable gradient checkpointing to reduce memory usage
+        self.t5.gradient_checkpointing_enable()
+        # AutoTokenizer handles both flan-t5 and SciFive tokenizer formats
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         d_model = self.t5.config.d_model
 
@@ -111,7 +115,7 @@ class HybridReportGenerator(nn.Module):
 
     def forward(
         self,
-        region_features,     # (B, 196, 256)  — 14×14 P4 tokens
+        region_features,     # (B, N, 256)  — spatial visual tokens from cache
         entity_vector,       # (B, 14)
         retrieved_texts,     # list[str]
         prompt_texts,        # list[str]
@@ -121,11 +125,24 @@ class HybridReportGenerator(nn.Module):
         device = region_features.device
         B = region_features.size(0)
 
+        # ── 0. Pool visual tokens to 49 (7×7) ────────────────────────────────
+        # T5's positional embedding hard-caps at 512.  Budget breakdown:
+        #   49 visual + 4 entity + 128 retrieved + ~25 prompt ≈ 206 tokens
+        # Works with any input N (e.g. 196=14×14 from old cache, 784=28×28 new)
+        N = region_features.size(1)
+        H = int(N ** 0.5)
+        region_features = (
+            region_features.view(B, H, H, 256)
+            .permute(0, 3, 1, 2)                         # (B, 256, H, H)
+        )
+        region_features = F.adaptive_avg_pool2d(region_features, (7, 7))  # (B, 256, 7, 7)
+        region_features = region_features.flatten(2).transpose(1, 2)      # (B, 49, 256)
+
         # ── 1. Visual tokens: LayerNorm → Linear → Dropout ───────────────────
-        region_normed = self.visual_norm(region_features)           # (B, 196, 256)
+        region_normed = self.visual_norm(region_features)           # (B, 49, 256)
         visual_tokens = self.visual_drop(
             self.visual_proj(region_normed)
-        )                                                           # (B, 196, d_model)
+        )                                                           # (B, 49, d_model)
         visual_mask = torch.ones(B, visual_tokens.size(1), device=device)
 
         # ── 2. Entity tokens: 2-layer MLP → N_ENTITY_TOKENS dense tokens ─────
@@ -135,12 +152,13 @@ class HybridReportGenerator(nn.Module):
         entity_mask = torch.ones(B, self.n_entity_tokens, device=device)
 
         # ── 3. Retrieved text tokens ──────────────────────────────────────────
+        # Capped at 128 tokens: keeps total sequence < 206, well within T5's 512
         retrieved_enc = self.tokenizer(
             retrieved_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=384,
+            max_length=128,
         ).to(device)
         retrieved_embeds = self.t5.encoder.embed_tokens(retrieved_enc.input_ids)
         retrieved_mask   = retrieved_enc.attention_mask
@@ -170,7 +188,7 @@ class HybridReportGenerator(nn.Module):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=512,
+                max_length=128,   # 60-word cap ≈ 80-100 tokens; 128 adds headroom
             ).to(device)
 
             labels = target_enc.input_ids.clone()
@@ -193,15 +211,19 @@ class HybridReportGenerator(nn.Module):
             return loss
 
         # ── 7. Inference ──────────────────────────────────────────────────────
+        # num_beams=3: matches SAENet paper (Section 4.2 beam_size=3)
+        # max_new_tokens=80: ~60 words × 1.3 tokens/word + headroom
+        # length_penalty=1.2: rewards complete sentences without over-generating
+        # no_repeat_ngram_size=4: less aggressive than 3 — medical terms have
+        #   legitimate 3-gram repeats (e.g. "no pleural effusion")
+        # repetition_penalty removed: penalises legitimate anatomical repetition
         generated_ids = self.t5.generate(
             inputs_embeds=encoder_inputs,
             attention_mask=attention_mask,
-            max_new_tokens=100,
-            num_beams=6,
-            length_penalty=0.8,
-            no_repeat_ngram_size=3,
-            repetition_penalty=1.3,
-            min_length=20,
+            max_new_tokens=80,
+            num_beams=3,
+            length_penalty=1.2,
+            no_repeat_ngram_size=4,
             early_stopping=True,
         )
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)

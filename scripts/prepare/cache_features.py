@@ -25,6 +25,7 @@ import sys
 # ── Third-party ───────────────────────────────────────────────────────────
 import faiss
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -41,6 +42,25 @@ from models import CrossModalAlignment, MultiViewBackbone, ProjectionHead
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
+
+_FPN_KEY_REMAP = {
+    "fpn.output_c2": "fpn.output_p2",
+    "fpn.output_c3": "fpn.output_p3",
+    "fpn.output_c4": "fpn.output_p4",
+    "fpn.output_c5": "fpn.output_p5",
+}
+
+
+def _remap_fpn_keys(state_dict: dict) -> dict:
+    """Translate legacy output_c* keys to output_p* when needed."""
+    new_sd = {}
+    for k, v in state_dict.items():
+        for old, new in _FPN_KEY_REMAP.items():
+            if k.startswith(old):
+                k = new + k[len(old):]
+                break
+        new_sd[k] = v
+    return new_sd
 
 
 # =============================================================================
@@ -82,11 +102,22 @@ def _build_cache(
 
             per_rank = []
             for k in range(k_variants):
-                reps_k     = [train_metadata[I[b][k]]["report"] for b in range(B)]
-                af_k, _, _ = alignment(visual_features, reps_k)        # (B, 196, 256)
+                reps_k     = [train_metadata[I[b][k]]['report'] for b in range(B)]
+                af_k, _, _ = alignment(visual_features, reps_k)        # (B, H*W, 256)
+
+                # Pool spatial tokens to 49 (7×7) for compact cache storage.
+                # This is backward-compatible: hybrid_generator pools anyway, so
+                # pre-pooling here halves cache size (~0.7 GB vs ~2.7 GB for P3)
+                # and eliminates per-step pooling overhead during stage-3 training.
+                Bs, Ns, Cs = af_k.shape
+                Hs = int(Ns ** 0.5)
+                af_k_spatial = af_k.view(Bs, Hs, Hs, Cs).permute(0, 3, 1, 2)  # (B, 256, H, H)
+                af_k_pooled  = F.adaptive_avg_pool2d(af_k_spatial, (7, 7))     # (B, 256, 7, 7)
+                af_k_pooled  = af_k_pooled.flatten(2).transpose(1, 2)          # (B, 49, 256)
+
                 rep_ent_k  = torch.sigmoid(report_classifier(reps_k))  # (B, 14)
                 ev_k       = img_entities * rep_ent_k                  # (B, 14) soft-AND
-                per_rank.append((af_k.cpu().float(), ev_k.cpu().float(), reps_k))
+                per_rank.append((af_k_pooled.cpu().float(), ev_k.cpu().float(), reps_k))
 
             for b in range(B):
                 cache.append({
@@ -125,7 +156,7 @@ def main() -> None:
 
     # ── Load frozen models ─────────────────────────────────────────────────
     visual_encoder = MultiViewBackbone().to(device)
-    visual_encoder.load_state_dict(ckpt["visual_model"])
+    visual_encoder.load_state_dict(_remap_fpn_keys(ckpt["visual_model"]))
     visual_encoder.eval()
 
     alignment = CrossModalAlignment().to(device)

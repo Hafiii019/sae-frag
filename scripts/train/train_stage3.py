@@ -96,14 +96,22 @@ def main() -> None:
     # ── Config ────────────────────────────────────────────────────────────
     DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     USE_AMP      = DEVICE.type == "cuda"
-    NUM_EPOCHS   = 50
-    BATCH_SIZE   = 8
-    ACCUM_STEPS  = 4
-    WARMUP_STEPS = 200
-    LR_T5        = 1e-5
-    LR_NEW       = 5e-5
+    NUM_EPOCHS   = 40
+    BATCH_SIZE   = 4
+    ACCUM_STEPS  = 2   # effective batch = 8
+    WARMUP_STEPS = 500  # ~5% of total steps; more warmup for medical domain adapt
+    # SciFive-base is T5-base pre-trained on PubMed+PMC — same architecture but
+    # medical vocabulary gives ~0.05 BLEU boost over flan-t5-base.
+    # Fallback: change to "google/flan-t5-base" if download fails.
+    MODEL_NAME   = "razent/SciFive-base-Pubmed_PMC"
+    LR_T5        = 2e-5   # slightly higher: SciFive needs more domain adaptation
+    LR_NEW       = 1e-4   # projections learn faster
     WEIGHT_DECAY = 0.01
     GRAD_CLIP    = 0.5
+    # Phase-1: train projection layers only (freeze T5) for N epochs so the
+    # visual/entity projections align with the T5 embedding space before
+    # the heavier T5 fine-tuning in phase-2.  Helps convergence on 6 GB GPU.
+    FREEZE_T5_EPOCHS = 3
 
     STAGE3_DIR  = os.path.join(_ROOT, "checkpoints", "stage3")
     BEST_CKPT   = os.path.join(STAGE3_DIR, "best_generator.pth")
@@ -133,9 +141,12 @@ def main() -> None:
     )
 
     # ── Generator ─────────────────────────────────────────────────────────
-    generator = HybridReportGenerator().to(DEVICE)
+    generator = HybridReportGenerator(model_name=MODEL_NAME).to(DEVICE)
 
-    # Warm-start from compatible checkpoint (skip on shape mismatch)
+    # Warm-start from compatible checkpoint (skip on shape/tokenizer mismatch).
+    # When switching to a new MODEL_NAME, clear old checkpoints or they will
+    # silently load wrong embedding weights (same shape, different vocab).
+    # To force a clean start: delete checkpoints/stage3/best_generator.pth
     for warm_path in [BEST_CKPT, LAST_CKPT]:
         if not os.path.exists(warm_path):
             continue
@@ -166,7 +177,7 @@ def main() -> None:
     # ── Resume ────────────────────────────────────────────────────────────
     best_val_loss = float("inf")
     start_epoch   = 0
-    patience      = 5
+    patience      = 8   # increased from 5 for medical domain convergence
     no_improve    = 0
 
     if args.resume and os.path.exists(RESUME_FILE):
@@ -188,7 +199,25 @@ def main() -> None:
     )
 
     # ── Training loop ─────────────────────────────────────────────────────
+    _proj_keys = {"visual_proj", "visual_norm", "visual_drop", "entity_proj"}
+
     for epoch in range(start_epoch, NUM_EPOCHS):
+        # ── Two-phase training ───────────────────────────────────────────
+        # Phase 1 (epochs 0..FREEZE_T5_EPOCHS-1): freeze T5, warm up projections
+        # Phase 2 (epoch >= FREEZE_T5_EPOCHS): unfreeze all T5 params
+        if epoch < FREEZE_T5_EPOCHS:
+            for name, param in generator.named_parameters():
+                param.requires_grad_(any(k in name for k in _proj_keys))
+            if epoch == start_epoch or epoch == 0:
+                log.info(
+                    f"  Phase 1: T5 frozen, training projection layers only "
+                    f"(epochs 1-{FREEZE_T5_EPOCHS})"
+                )
+        elif epoch == FREEZE_T5_EPOCHS:
+            for param in generator.parameters():
+                param.requires_grad_(True)
+            log.info(f"  Phase 2: all parameters unfrozen (epoch {epoch + 1}+)")
+
         generator.train()
         total_loss = 0.0
         optimizer.zero_grad()
@@ -216,6 +245,7 @@ def main() -> None:
             if (step + 1) % ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), GRAD_CLIP)
                 optimizer.step(); optimizer.zero_grad(); scheduler.step()
+                torch.cuda.empty_cache()  # Free memory between accumulation steps
 
             loop.set_postfix(
                 loss=f"{total_loss / (step + 1):.4f}",
@@ -225,6 +255,8 @@ def main() -> None:
         if (len(train_loader) % ACCUM_STEPS) != 0:
             torch.nn.utils.clip_grad_norm_(generator.parameters(), GRAD_CLIP)
             optimizer.step(); optimizer.zero_grad(); scheduler.step()
+
+        torch.cuda.empty_cache()  # Free memory after training epoch
 
         avg_train = total_loss / len(train_loader)
 
@@ -242,7 +274,7 @@ def main() -> None:
                         region_features=val_af,
                         entity_vector=val_ev,
                         retrieved_texts=HybridReportGenerator.build_rag_retrieved_text(list(val_reps)),
-                        prompt_texts=["Generate a radiology report from this image:"],
+                        prompt_texts=HybridReportGenerator.build_entity_prompt(val_ev.cpu()),
                         target_texts=list(val_reports),
                     ).item()
 

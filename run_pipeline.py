@@ -13,15 +13,26 @@ Usage
 
 Stages (in order)
 -----------------
-  stage1       — visual-language contrastive alignment
-  report_cls   — report classifier (text-side pseudo-label teacher)
-  stage2       — image classifier (distilled from report_cls)
-  mine_pairs   — factual pair mining for FactMM-RAG retriever
-  retriever    — fact-aware multimodal dense retriever
-  cache        — cache visual features to disk
+  stage1       — visual-language contrastive alignment (ResNet101 + FPN + SAFE)
+  report_cls   — text-side CheXpert pseudo-label classifier (Bio-ClinicalBERT)
+  stage2       — image classifier distilled from report_cls
+  mine_pairs   — factual pair mining via RadGraph entity-F1 (FactMM-RAG eq.1)
+  retriever    — fact-aware multimodal dense retriever (InfoNCE)
   index        — build FAISS retrieval index
-  stage3       — flan-t5-large report generator
-  evaluate     — BLEU / ROUGE / ClinicalBERT metrics
+  cache        — pre-compute + cache frozen model outputs for stage3
+  stage3       — SciFive-base / flan-t5-base report generator (two-phase)
+  evaluate     — BLEU / ROUGE / CheXBert / Entity-F1 metrics
+
+Key design choices (applied since March 2025 refactor)
+-------------------------------------------------------
+  * Report targets capped at 60 words  (SAENet paper §4.1)
+  * SAFE uses P3 (28×28) instead of P4 (14×14)  — 4× better spatial resolution
+  * Visual tokens pooled to 49 (7×7) before T5  — stays under 512-token limit
+  * Retrieved text capped at 128 tokens          — total encoder ≤ 206 tokens
+  * Generator: SciFive-base (medically pre-trained T5-base) with two-phase
+    training (freeze T5 for 3 epochs, then full fine-tune)
+  * num_beams=3, no repetition_penalty, length_penalty=1.2  (matches paper)
+  * Factual pairs mined with RadGraph entity-F1 ≥ 0.3  (not Jaccard)
 """
 
 import argparse
@@ -56,8 +67,8 @@ STAGES = [
     ),
     (
         "mine_pairs",
-        "Factual Pair Mining (FactMM-RAG)",
-        "scripts/prepare/mine_factual_pairs.py --delta 0.5 --top_k 2",
+        "Factual Pair Mining — RadGraph entity-F1 (FactMM-RAG eq.1)",
+        "scripts/prepare/mine_factual_pairs.py --delta 0.3 --top_k 2",
         "store/factual_pairs.pkl",
     ),
     (
@@ -68,7 +79,7 @@ STAGES = [
     ),
     (
         "cache",
-        "Cache Visual Features",
+        "Cache Visual Features (pool to 49 tokens)",
         "scripts/prepare/cache_features.py",
         "store/cache_train.pt",
     ),
@@ -80,7 +91,7 @@ STAGES = [
     ),
     (
         "stage3",
-        "Stage 3 — Report Generator",
+        "Stage 3 — Report Generator (SciFive-base, two-phase training)",
         "scripts/train/train_stage3.py",
         "checkpoints/stage3/best_generator.pth",
     ),

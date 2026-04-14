@@ -1,25 +1,102 @@
-# 05 — Stage 3: FAISS Knowledge Base
+# 05 — Stage 3: Factual Pair Mining, FAISS Index, and Feature Cache
 
 ## Purpose
 
-Build a dense vector database over the **entire training set**. At query time, given a test image, the system retrieves the most visually similar training case (report + entity vector).
-
-This turns the training set into a **long-term memory** that the generator can consult.
+Build a dense vector database over the **entire training set**, trained with
+**RadGraph entity-F1 factual supervision** (FactMM-RAG, NAACL 2025). At query
+time the system retrieves the most factually-aligned training report to augment
+the generator.
 
 ---
 
-## Script
+## Scripts (run in order)
 
 ```bash
-python -m rag.build_faiss_fast
+# 1. Mine factual pairs with RadGraph entity-F1 (FactMM-RAG eq.1)
+#    Two-stage: Jaccard pre-filter (0.10) → entity-F1 ≥ 0.30
+#    Output: store/factual_pairs.pkl + store/radgraph_cache.json
+python scripts/prepare/mine_factual_pairs.py --delta 0.3 --top_k 2
+
+# 2. Train fact-aware multimodal retriever on mined pairs
+#    Output: checkpoints/stage1/factual_retriever.pth
+python scripts/train/train_factual_retriever.py
+
+# 3. Build FAISS inner-product index using trained document encoder
+#    Output: store/faiss_index.bin + store/train_reports.pkl
+python scripts/prepare/build_index.py
+
+# 4. Cache frozen outputs for Stage-3 generator training
+#    Visual tokens pooled to 49 (7×7), cache size ~0.7 GB
+#    Output: store/cache_train.pt + store/cache_val.pt
+python scripts/prepare/cache_features.py
 ```
 
 **Output files:**
 
 | File | Contents |
 |------|----------|
-| `rag/faiss_index.bin` | FAISS flat L2 index of training image embeddings |
-| `rag/train_reports.pkl` | List of `{report: str, entity_vector: Tensor}` per training sample |
+| `store/factual_pairs.pkl` | `{train_idx: [pos_idx, ...]}` mined by entity-F1 |
+| `store/radgraph_cache.json` | RadGraph extraction cache (avoids re-running NER) |
+| `store/faiss_index.bin` | FAISS flat inner-product index (256-dim, L2-normalised) |
+| `store/train_reports.pkl` | List of `{report: str, entity_vector: Tensor}` |
+| `store/cache_train.pt` | Pre-computed (49, 256) visual tokens + entity vectors |
+| `store/cache_val.pt` | Val split cache |
+
+---
+
+## Step 1: RadGraph Entity-F1 Pair Mining
+
+Implements FactMM-RAG equation 1:
+
+$$s(q, d) = \frac{2\,|\hat{q} \cap \hat{d}|}{|\hat{q}| + |\hat{d}|}$$
+
+where $\hat{q}$, $\hat{d}$ are sets of (token, label) tuples from RadGraph NER+RE.
+
+**Two-stage strategy** (tractable on 6 GB GPU):
+1. Jaccard pre-filter (threshold 0.10) on 14 CheXbert labels — fast, O(N²) vectorised
+2. RadGraph entity-F1 on pre-filtered candidates only — O(N × candidates) set ops
+
+Results are cached to `store/radgraph_cache.json` so re-runs are near-instant.
+
+---
+
+## Step 3: How the FAISS Index is Built
+
+### Models Loaded (frozen from factual_retriever.pth or stage1/best.pth)
+
+```python
+visual_encoder = MultiViewBackbone()   # ResNet101 + FPN + SAFE@P3
+proj_img       = ProjectionHead()      # 256→256, L2-normalised
+alignment      = CrossModalAlignment() # Bio-ClinicalBERT cross-attention
+proj_doc       = DocumentProjectionHead()  # doc embedding head
+```
+
+### Per-Sample Processing
+
+```
+For each training sample:
+  1. visual_features = visual_encoder(images)       (B, 256, 28, 28)
+  2. global_feat = visual_features.flatten(2).mean(dim=2)   (B, 256)
+  3. img_emb = proj_img(global_feat)                (B, 256), L2-normalised
+  4. doc_emb = proj_doc(alignment(visual_features, [report]).mean(1))  # if factual ckpt
+  5. faiss_vec = doc_emb if factual else img_emb
+```
+
+---
+
+## Step 4: Feature Cache (49-token pooling)
+
+The cache pre-computes aligned features and entity vectors so Stage-3 training
+never touches BERT or the visual backbone:
+
+```
+aligned_features (784, 256)  → adaptive_avg_pool2d → (49, 256)  stored
+entity_vector   (14,)                                            stored
+retrieved_text  str                                              stored
+```
+
+Pooling from 784→49 reduces cache from ~2.7 GB to ~0.7 GB and eliminates
+per-step pooling overhead during training.
 
 ---
 
@@ -43,9 +120,8 @@ report_classifier = ReportClassifier()
 ### Per-Sample Processing
 
 ```
-For each training sample (batch_size=1):
-
-  1. visual_features = visual_encoder(images)       (B, 256, 7, 7)
+For each training sample:
+  1. visual_features = visual_encoder(images)       (B, 256, 28, 28)
   2. global_feat = visual_features.flatten(2).mean(dim=2)   (B, 256)
                    ↑ spatial average: one vector per image pair
   3. img_emb = proj_img(global_feat)                (B, 256), L2-normalized

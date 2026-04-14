@@ -272,8 +272,11 @@ class RadGraphExtractor:
             warnings.warn(
                 f"RadGraph unavailable ({exc}).\n"
                 "Falling back to keyword-based entity extraction.\n"
-                "This affects evaluate.py Entity F1 scores — results will be approximate.\n"
-                "To fix: pip install radgraph  (requires transformers < 4.40)",
+                "This will reduce pair-mining quality and entity F1 scores.\n"
+                "To fix:\n"
+                "  1. conda install -n ergonomics h5py -c conda-forge\n"
+                "  2. pip install radgraph>=0.1.18\n"
+                "  See requirements.txt for full dependency list.",
                 stacklevel=2,
             )
             logger.warning("RadGraph unavailable (%s). Using keyword fallback.", exc)

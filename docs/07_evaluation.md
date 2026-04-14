@@ -3,8 +3,125 @@
 ## Running Evaluation
 
 ```bash
-python -m rag.evaluate_hybrid
+# Full evaluation: BLEU, METEOR, ROUGE-L, CheXBert F1, Entity F1
+python scripts/evaluate/evaluate.py
+
+# Inference only (write generated_reports.json, no metric print)
+python scripts/evaluate/infer.py
 ```
+
+---
+
+## Evaluation Pipeline (`scripts/evaluate/evaluate.py`)
+
+Runs the full inference pipeline over the **test split** and computes all metrics.
+
+### Step-by-Step
+
+```
+For each test sample (image, reference_report):
+
+  1. Load pre-computed cache (aligned_features 49×256, entity_vector 14)
+  2. Run fact verification: verified = img_entities ⋅ rep_entities
+  3. generated = generator(aligned_features, verified, [retrieved_report], [prompt])
+  4. Compute BLEU-1/2/3/4, METEOR, ROUGE-L vs reference_report
+  5. Compute CheXBert F1 (micro/macro) vs reference labels
+  6. Compute RadGraph Entity F1 vs reference entities
+```
+
+---
+
+## Metrics
+
+### BLEU (Bilingual Evaluation Understudy)
+
+Measures n-gram precision: fraction of n-grams in the generated text that appear in the reference.
+
+| Metric | Weights | What It Measures |
+|--------|---------|------------------|
+| BLEU-1 | (1,0,0,0) | Unigram (word-level) overlap |
+| BLEU-2 | (0.5,0.5,0,0) | Bigram overlap |
+| BLEU-3 | (0.33,0.33,0.33,0) | Trigram overlap |
+| BLEU-4 | (0.25,0.25,0.25,0.25) | 4-gram overlap |
+
+Smoothing (method1) is applied because 60-word reports can make unsmoothed BLEU-3/4 collapse to zero.
+
+**Range:** 0–1. SAENet target: BLEU-1 ≈ 0.50, BLEU-4 ≈ 0.17.
+
+---
+
+### METEOR
+
+Considers precision, recall, and **synonym matching** via WordNet. More robust than BLEU for paraphrased but semantically equivalent text.
+
+**Range:** 0–1. Typical radiology range: 0.15–0.35.
+
+---
+
+### ROUGE-L
+
+Finds the longest common subsequence between reference and generated text. `use_stemmer=True` strips word endings before matching.
+
+**Range:** 0–1. Typical range: 0.20–0.40.
+
+---
+
+### CheXBert Clinical F1
+
+Uses the CheXBert labeller to extract 14 binary pathology labels from both generated and reference reports, then computes:
+
+- **Micro F1**: treats each label×sample pair equally — dominated by common negatives
+- **Macro F1**: averages F1 per condition — sensitive to rare positives like "Pneumothorax"
+- **Per-class F1**: one score per condition (useful for debugging hallucination)
+
+This is the primary **clinical accuracy** signal — BLEU can be gamed by fluent but factually wrong text.
+
+---
+
+### RadGraph Entity F1 (FactMM-RAG eq.1)
+
+Extracts (token, label) entity sets with RadGraph NER+RE from both generated and reference reports:
+
+$$\text{Entity-F1}(g, r) = \frac{2\,|\hat{g} \cap \hat{r}|}{|\hat{g}| + |\hat{r}|}$$
+
+Captures clinical entity precision/recall at the sub-sentence level. A report that lists the right anatomical findings in the wrong order still scores well here.
+
+---
+
+## Interpreting Results
+
+```
+==== FINAL RESULTS ====
+BLEU-1:  0.XXX    ← word precision
+BLEU-2:  0.XXX    ← phrase precision
+BLEU-3:  0.XXX    ← clause precision
+BLEU-4:  0.XXX    ← sentence-level precision
+METEOR:  0.XXX    ← synonym-aware recall
+ROUGE-L: 0.XXX    ← sequence-level recall
+CheXBert Micro F1: 0.XXX
+CheXBert Macro F1: 0.XXX
+Entity F1: 0.XXX
+```
+
+Expected trends:
+- BLEU-4 < BLEU-3 < BLEU-2 < BLEU-1 (longer n-grams harder to match exactly)
+- METEOR > BLEU-1 (rewards recall; BLEU only rewards precision)
+- ROUGE-L often between METEOR and BLEU-1
+- CheXBert Micro F1 ≫ Macro F1 (negatives dominate; check Macro for clinical utility)
+
+---
+
+## Baseline Comparison
+
+| System | Generator | Entity-F1 Pairs | Expected BLEU-4 |
+|--------|-----------|-----------------|-----------------|
+| RAG-only T5 (no visual) | Flan-T5-base | Jaccard | Lower |
+| Full SAE-FRAG (this repo) | SciFive-base-Pubmed_PMC | RadGraph entity-F1 | Higher |
+
+The hybrid system adds three novel components over the RAG-only baseline:
+1. Region-aligned visual tokens (image understanding)
+2. Fact-verified entity tokens (hallucination reduction)
+3. ClinicalBERT-guided regional alignment (clinical semantics in visual features)
 
 ---
 

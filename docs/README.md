@@ -4,11 +4,11 @@
 
 SAE-FRAG is a multi-stage deep learning system for **automatic radiology report generation** from chest X-ray images. It combines:
 
-- **SAEnet** (Spatially-Aware Enhanced Network) — a multi-view visual backbone built on ResNet101 + FPN + SAFE attention
-- **Cross-Modal Alignment** — region-level image-text alignment using ClinicalBERT
-- **FAISS-based RAG** — retrieval-augmented generation using a dense knowledge base of training reports
-- **Fact Verification** — entity-level intersection between image predictions and retrieved report findings
-- **Hybrid Generator** — Flan-T5 decoder that receives region-aligned features, verified entity tokens, retrieved context, and a task prompt
+- **SAENet** (Spatially-Aware Enhanced Network) — ResNet-101 + FPN + SAFE attention at **P3 resolution (28×28)**
+- **Cross-Modal Alignment** — region-level image-text alignment using Bio-ClinicalBERT
+- **FactMM-RAG Retrieval** — fact-aware FAISS retrieval trained with RadGraph entity-F1 pair supervision
+- **Fact Verification** — soft-AND combining image and retrieved-report entity predictions
+- **Hybrid Generator** — SciFive-base decoder (medically pre-trained T5-base) receiving 49 visual + entity + retrieved context tokens
 
 ---
 
@@ -24,57 +24,58 @@ SAE-FRAG is a multi-stage deep learning system for **automatic radiology report 
 
 Each sample contains:
 - Two X-ray views (frontal + lateral) as `(2, 3, 224, 224)` tensors
-- Combined `findings` + `impression` text as a single cleaned report string
+- Combined `findings` + `impression` text, cleaned and **capped at 60 words** (SAENet §4.1)
 
 ---
 
-## Four-Stage Training Pipeline
+## Multi-Stage Training Pipeline
 
 ```
-Stage 1 → Stage 2 → Stage 3 → Stage 4
- Align     Classify  Index     Generate
+Stage 1 → Stage 2 → mine_pairs → retriever → build_index → cache → Stage 3
+ Align     Classify   RadGraph     InfoNCE      FAISS         49-tok   Generate
 ```
 
 | Stage | Script | Output |
 |-------|--------|--------|
-| 1. Visual-Language Alignment | `train.py` | `checkpoints/best_stage1.pth` |
-| 2a. Report Entity Classifier | *(pre-trained)* | `classification/report_classifier.pth` |
-| 2b. Image Entity Classifier | `classification/train_image_classifier.py` | `classification/image_classifier.pth` |
-| 3. Build FAISS Knowledge Base | `rag/build_faiss_fast.py` | `rag/faiss_index.bin` + `rag/train_reports.pkl` |
-| 4. Train Hybrid Generator | `rag/train_hybrid_generator.py` | `rag/hybrid_generator.pth` |
+| 1. Visual-Language Alignment | `train_stage1.py` | `checkpoints/stage1/best.pth` |
+| 2a. Report Entity Classifier | `train_report_classifier.py` | `checkpoints/stage2/report_classifier.pth` |
+| 2b. Image Entity Classifier | `train_stage2.py` | `checkpoints/stage2/image_classifier.pth` |
+| 3a. Factual Pair Mining | `mine_factual_pairs.py` | `store/factual_pairs.pkl` |
+| 3b. Fact-Aware Retriever | `train_factual_retriever.py` | `checkpoints/stage1/factual_retriever.pth` |
+| 3c. FAISS Index | `build_index.py` | `store/faiss_index.bin` |
+| 3d. Feature Cache (49-token) | `cache_features.py` | `store/cache_train.pt` |
+| 3e. Report Generator | `train_stage3.py` | `checkpoints/stage3/best_generator.pth` |
 
 ---
 
 ## Evaluation
 
 ```bash
-python -m rag.evaluate_hybrid
+python scripts/evaluate/evaluate.py
 ```
 
-Metrics reported: BLEU-1/2/3/4, METEOR, ROUGE-L
+Metrics reported: BLEU-1/2/3/4, METEOR, ROUGE-1/2/L, CIDEr, CheXBert F1 (micro/macro/per-class), Entity F1
 
 ---
 
 ## Quick-Start Execution Order
 
 ```bash
-# 0. Create data splits
-python tools/create_split.py
+conda activate ergonomics
 
-# 1. Stage 1 — Visual-Language alignment
-python train.py
+# Option A: Full automated pipeline
+python run_pipeline.py
 
-# 2. Stage 2 — Image classifier (uses report_classifier as pseudo-labeler)
-python -m classification.train_image_classifier
-
-# 3. Stage 3 — Build FAISS index
-python -m rag.build_faiss_fast
-
-# 4. Stage 4 — Train hybrid generator
-python -m rag.train_hybrid_generator
-
-# 5. Evaluate
-python -m rag.evaluate_hybrid
+# Option B: Manual step-by-step
+python scripts/train/train_stage1.py
+python scripts/train/train_report_classifier.py
+python scripts/train/train_stage2.py
+python scripts/prepare/mine_factual_pairs.py --delta 0.3 --top_k 2
+python scripts/train/train_factual_retriever.py
+python scripts/prepare/build_index.py
+python scripts/prepare/cache_features.py
+python scripts/train/train_stage3.py
+python scripts/evaluate/evaluate.py
 ```
 
 ---

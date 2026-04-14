@@ -101,12 +101,17 @@ class FPN(nn.Module):
 class SAFE(nn.Module):
     """Spatial Attention Feature Enhancement.
 
-    C5 semantic features (7×7) query P4 detail features (14×14) via
-    multi-head cross-attention.  P4 retains 4× more spatial tokens than P5,
+    C5 semantic features (7×7) query P3 detail features (28×28) via
+    multi-head cross-attention.  P3 retains 16× more spatial tokens than P5,
     preserving small nodules, localised effusions, and subtle opacities.
+    Using P3 (28×28=784 tokens) rather than P2 (56×56=3136) keeps VRAM
+    within the 6 GB budget while giving 4× better detail than P4 (14×14).
 
-    Input  — c5: (B, 2048, 7, 7)   p4: (B, 256, 14, 14)
-    Output — (B, 256, 14, 14)
+    Matches SAENet eq.5: V' = MHA(Vf, V'f, V'f) + MHA(Vl, V'l, V'l)
+    where Vf = C5 global features and V'f = fused P3 local features.
+
+    Input  — c5: (B, 2048, 7, 7)   p3: (B, 256, 28, 28)
+    Output — (B, 256, 28, 28)
     """
 
     def __init__(self, embed_dim: int = 256, num_heads: int = 8):
@@ -114,15 +119,15 @@ class SAFE(nn.Module):
         self.query_proj = nn.Conv2d(2048, embed_dim, kernel_size=1)
         self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
-    def forward(self, c5, p4):
-        B, _, H4, W4 = p4.shape
+    def forward(self, c5, p3):
+        B, _, H3, W3 = p3.shape
         q = self.query_proj(c5)                                      # (B, 256, 7, 7)
-        q = F.interpolate(q, size=(H4, W4), mode="bilinear",
-                          align_corners=False)                        # (B, 256, 14, 14)
-        q_flat  = q.flatten(2).transpose(1, 2)                       # (B, 196, 256)
-        kv_flat = p4.flatten(2).transpose(1, 2)                      # (B, 196, 256)
-        enhanced, _ = self.mha(q_flat, kv_flat, kv_flat)            # (B, 196, 256)
-        enhanced = enhanced.transpose(1, 2).reshape(B, 256, H4, W4)
+        q = F.interpolate(q, size=(H3, W3), mode="bilinear",
+                          align_corners=False)                        # (B, 256, 28, 28)
+        q_flat  = q.flatten(2).transpose(1, 2)                       # (B, 784, 256)
+        kv_flat = p3.flatten(2).transpose(1, 2)                      # (B, 784, 256)
+        enhanced, _ = self.mha(q_flat, kv_flat, kv_flat)            # (B, 784, 256)
+        enhanced = enhanced.transpose(1, 2).reshape(B, 256, H3, W3)
         return enhanced + q
 
 
@@ -134,28 +139,32 @@ class MultiViewBackbone(nn.Module):
     """Dual-view visual encoder: ResNet-101 → FPN → SAFE.
 
     Input  : (B, 2, 3, 224, 224)
-    Output : (B, 256, 14, 14)  — 196 spatial tokens at P4 resolution
+    Output : (B, 256, 28, 28)  — 784 spatial tokens at P3 resolution
+
+    View fusion matches SAENet eq.5:
+        V' = MHA(Vf, V'f, V'f) + MHA(Vl, V'l, V'l)
+    i.e. each view is independently enhanced by SAFE then summed.
+    NOTE: requires full pipeline rebuild (stage1 → build_index → cache_features)
     """
 
     def __init__(self):
         super().__init__()
-        self.backbone  = ResNet101Backbone(pretrained=True)
-        self.fpn       = FPN(out_channels=256)
-        self.safe      = SAFE(embed_dim=256, num_heads=8)
-        self.view_attn = nn.Parameter(torch.zeros(2))
+        self.backbone = ResNet101Backbone(pretrained=True)
+        self.fpn      = FPN(out_channels=256)
+        self.safe     = SAFE(embed_dim=256, num_heads=8)
 
     def forward(self, x):
         B, V, C, H, W = x.shape
 
         def _encode(view):
             c2, c3, c4, c5 = self.backbone(view)
-            _, _, p4, _    = self.fpn(c2, c3, c4, c5)
-            return self.safe(c5, p4)
+            _, p3, _, _    = self.fpn(c2, c3, c4, c5)   # P3: 28×28, 256-ch
+            return self.safe(c5, p3)
 
-        feat1 = _encode(x[:, 0])
-        feat2 = _encode(x[:, 1])
-        w = torch.softmax(self.view_attn, dim=0)
-        return w[0] * feat1 + w[1] * feat2
+        feat1 = _encode(x[:, 0])   # (B, 256, 28, 28) frontal
+        feat2 = _encode(x[:, 1])   # (B, 256, 28, 28) lateral
+        # Additive dual-view fusion: SAENet eq.5 V' = MHA(Vf,...) + MHA(Vl,...)
+        return feat1 + feat2
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -165,20 +174,31 @@ class MultiViewBackbone(nn.Module):
 class CrossModalAlignment(nn.Module):
     """Bio_ClinicalBERT text encoder + image-text cross-attention.
 
-    BERT is frozen; only the linear projection and cross-attention head train.
+    The BERT encoder is frozen; only the linear projection and cross-attention
+    head are trained.
 
-    Input  — image_features: (B, 256, H, W)  reports: list[str]
-    Output — aligned_features: (B, H*W, 256)  cls_token: (B, 256)  attn: (B, H*W, L)
+    Input
+    -----
+    image_features : (B, 256, H, W)  — any spatial size; P4 gives (B,256,14,14)
+    reports        : list[str]
+
+    Output
+    ------
+    aligned_features : (B, H*W, 256) — image tokens after cross-attending text
+    cls_token        : (B, 256)      — global text embedding
+    attn_weights     : (B, H*W, L)   — attention weight map
     """
 
     def __init__(self, embed_dim: int = 256, num_heads: int = 8):
         super().__init__()
         self.tokenizer    = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
         self.text_encoder = AutoModel.from_pretrained(
-            "emilyalsentzer/Bio_ClinicalBERT", use_safetensors=True
+            "emilyalsentzer/Bio_ClinicalBERT", torch_dtype="auto"
         )
+        # Freeze BERT — only the projection and attention head are trained
         for param in self.text_encoder.parameters():
             param.requires_grad = False
+
         self.text_proj     = nn.Linear(768, embed_dim)
         self.cross_attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
@@ -417,7 +437,7 @@ class CrossModalAlignment(nn.Module):
         super().__init__()
         self.tokenizer    = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
         self.text_encoder = AutoModel.from_pretrained(
-            "emilyalsentzer/Bio_ClinicalBERT", use_safetensors=True
+            "emilyalsentzer/Bio_ClinicalBERT", torch_dtype="auto"
         )
         # Freeze BERT — only the projection and attention head are trained
         for param in self.text_encoder.parameters():
@@ -431,7 +451,7 @@ class CrossModalAlignment(nn.Module):
         img_tokens  = image_features.flatten(2).transpose(1, 2)    # (B, H*W, 256)
 
         encoding = self.tokenizer(
-            reports, padding=True, truncation=True, return_tensors="pt"
+            reports, padding=True, truncation=True, max_length=256, return_tensors="pt"
         ).to(image_features.device)
 
         text_out   = self.text_encoder(**encoding)

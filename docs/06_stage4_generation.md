@@ -6,7 +6,7 @@ Train a **text decoder** that takes four distinct inputs and generates a complet
 
 1. **Region-aligned visual features** — what the image shows, conditioned on the retrieved report
 2. **Verified entity vector** — confirmed pathology findings agreed by both image and report
-3. **Retrieved report text** — the most similar training case as context
+3. **Retrieved report text** — the most factually-similar training case as context
 4. **Task prompt** — instruction text guiding the generation style
 
 ---
@@ -14,24 +14,177 @@ Train a **text decoder** that takes four distinct inputs and generates a complet
 ## Scripts
 
 ```bash
-# Training
-python -m rag.train_hybrid_generator
+# Training (two-phase: freeze backbone 3 epochs, then full fine-tune)
+python scripts/train/train_stage3.py
 
-# Evaluation
-python -m rag.evaluate_hybrid
+# Inference only
+python scripts/evaluate/infer.py
+
+# Evaluation metrics
+python scripts/evaluate/evaluate.py
 ```
 
 ---
 
 ## HybridReportGenerator Architecture
 
-**File:** `rag/hybrid_generator.py`  
-**Base model:** `google/flan-t5-base` (encoder-decoder Transformer, d_model=768)
+**File:** `src/rag/hybrid_generator.py`  
+**Base model:** `razent/SciFive-base-Pubmed_PMC` (T5-base fine-tuned on PubMed + PMC, d_model=768)
+
+SciFive is used instead of Flan-T5 because it is pre-trained on the same biomedical domain as radiology reports, giving better initialisation for clinical language generation.
 
 ### Additional Parameters
 
 | Module | Input dim | Output dim | Purpose |
-|--------|-----------|-----------|---------|
+|--------|-----------|-----------|----------|
+| `visual_proj` | 256 | 768 | Project aligned image features to T5 embedding space |
+| `entity_embed` | 14 (vocab) | 768 | Learned embedding for each pathology label |
+
+---
+
+## Forward Pass — Encoder Input Construction
+
+The T5 encoder receives a **concatenated sequence** of four token groups:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  ENCODER INPUT SEQUENCE                                           │
+│                                                                  │
+│  [visual_tokens | entity_tokens | retrieved_tokens | prompt_tokens]│
+│   (B, 49, 768)   (B, K, 768)    (B, ≤128, 768)    (B, T, 768)   │
+│                                                                  │
+│  Total: ~49 + 4 + 128 + 25 = ~206 tokens ≪ T5 limit of 512       │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Token Group 1: Visual Tokens
+
+```python
+# aligned_features arrive pooled from cache: (B, 49, 256)
+visual_tokens = self.visual_proj(aligned_features)  # (B, 49, 256) → (B, 49, 768)
+visual_mask   = torch.ones(B, 49)
+```
+
+The 49 (7×7) tokens arrive pre-pooled from the feature cache (adaptive avg-pool
+of the original 784=28×28 aligned features). Each token covers one 7×7 macropatch
+of the dual-view fused image.
+
+### Token Group 2: Entity Tokens (Dynamic)
+
+```python
+entity_ids     = torch.arange(14).unsqueeze(0).expand(B, -1)   # (B, 14)
+entity_embeds  = self.entity_embed(entity_ids)                   # (B, 14, 768)
+
+# Per-sample: keep only ACTIVE (positive) entities
+for b in range(B):
+    active_embeds = entity_embeds[b][verified_entities[b].bool()]
+    # If cardiomegaly=1, effusion=1, rest=0 → only 2 entity tokens
+```
+
+Padding via `nn.utils.rnn.pad_sequence` for the batch.
+
+**Key design decision:** Only positive entities are included. This keeps the
+sequence short when few findings are present and ensures entity tokens always
+mean “this condition IS present.”
+
+### Token Group 3: Retrieved Report Tokens
+
+```python
+retrieved_enc    = tokenizer(retrieved_texts, max_length=128, truncation=True, ...)
+retrieved_embeds = t5.encoder.embed_tokens(retrieved_enc.input_ids)  # (B, ≤128, 768)
+```
+
+Capped at 128 tokens — a full retrieved report rarely exceeds this for 60-word
+capped reports. Keeps total sequence at ~206 tokens, well under T5’s 512-position
+limit.
+
+### Token Group 4: Prompt Tokens
+
+Example prompt:
+> “Generate a detailed radiology report based on the chest X-ray regions, verified clinical findings, and retrieved context.”
+
+---
+
+## Forward Pass — Training Mode
+
+```python
+if target_texts is not None:
+    target_enc = tokenizer(target_texts, max_length=128, ...)  # 60 words ≈ 90 tokens
+    outputs = self.t5(
+        inputs_embeds=encoder_inputs,
+        attention_mask=attention_mask,
+        labels=target_enc.input_ids         # teacher-forcing
+    )
+    return outputs.loss                     # cross-entropy
+```
+
+---
+
+## Forward Pass — Inference Mode
+
+```python
+else:
+    generated_ids = self.t5.generate(
+        inputs_embeds=encoder_inputs,
+        attention_mask=attention_mask,
+        max_new_tokens=80,          # 60-word target ≈ 80 BPE tokens
+        num_beams=3,                # beam search (SAENet paper), less VRAM than 4
+        length_penalty=1.2,         # slightly favour longer complete sentences
+        no_repeat_ngram_size=4,     # suppress 4-gram repetition
+        early_stopping=True
+    )
+    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+```
+
+---
+
+## Training Configuration
+
+**Script:** `scripts/train/train_stage3.py`
+
+| Parameter | Value | Note |
+|-----------|-------|------|
+| Base model | `razent/SciFive-base-Pubmed_PMC` | Biomedical T5-base |
+| Optimizer | AdamW | weight_decay=0.01 |
+| LR (SciFive layers) | 2e-5 | Low: pre-trained weights |
+| LR (new projections) | 1e-4 | Higher: random init |
+| Epochs | 40 | 8 was too few |
+| Warmup steps | 500 | Cosine annealing |
+| Batch size | 2 | 6 GB VRAM |
+| Grad clip | 1.0 | Stability |
+| Patience | 8 | Early stopping window |
+| `FREEZE_T5_EPOCHS` | 3 | Two-phase training |
+
+### Two-Phase Training
+
+- **Phase 1 (epochs 0–2):** SciFive backbone frozen, only `visual_proj` and `entity_embed` are updated. Projections learn to align visual/entity features to T5’s embedding space without corrupting pre-trained language priors.
+- **Phase 2 (epoch 3+):** All parameters unfrozen. Full fine-tuning with differential learning rates (SciFive 2e-5, new layers 1e-4).
+
+---
+
+## Complete Training Step
+
+```python
+# All upstream models frozen, all no_grad
+with torch.no_grad():
+
+    # 1. Load pre-computed cache (avoids re-running BERT/backbone each step)
+    aligned_features  = cache["aligned_features"]     # (B, 49, 256) pooled
+    entity_vector     = cache["entity_vector"]         # (B, 14)
+    retrieved_reports = cache["retrieved_text"]        # list[str]
+
+# 2. Fact verification (image ∩ retrieved)
+# (image classifier is run once per epoch in build_index, cached)
+verified_entities = img_entities * rep_entities                    # (B, 14)
+
+# 3. Generate and compute cross-entropy loss
+loss = generator(
+    aligned_features, verified_entities,
+    retrieved_reports, [prompt] * B,
+    target_texts=reports
+)
+loss.backward()
+```
 | `visual_proj` | 256 | 768 | Project aligned image features to T5 embedding space |
 | `entity_embed` | 14 (vocab) | 768 | Learned embedding for each pathology label |
 

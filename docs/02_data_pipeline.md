@@ -80,26 +80,29 @@ For each sample:
   1. Load up to 2 images from disk
   2. If only 1 image exists → duplicate it (always output 2 views)
   3. Stack → (2, 3, 224, 224)
-  4. Clean the report text
-  5. Return (images_tensor, report_string)
+  4. Clean the report text (remove xxxx tokens, collapse whitespace)
+  5. Cap at 60 words  ← matches SAENet paper Section 4.1
+  6. Return (images_tensor, report_string)
 ```
 
 ### Image Transforms
 
-Applied to every loaded image:
+CXR-safe augmentation rules (train split only):
 
-```python
-transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],   # ImageNet mean (RGB)
-        std=[0.229, 0.224, 0.225]     # ImageNet std
-    )
-])
-```
+| Transform | Reason |
+|-----------|--------|
+| `RandomResizedCrop(224, scale=0.75–1.0)` | Patient distance / zoom variation |
+| `RandomRotation(±15°)` | Table positioning variation |
+| `RandomAffine(translate=0.05)` | Small shifts |
+| `ColorJitter(brightness=0.3, contrast=0.3)` | Scanner exposure variation |
+| `RandomAdjustSharpness` | Different scanner sharpness |
+| `RandomEqualize(p=0.2)` | CLAHE-like histogram normalisation |
+| `GaussianBlur(p=0.3)` | Motion blur simulation |
+| `RandomErasing(p=0.2)` | Foreign objects / occlusion |
 
-Images are loaded as RGB (`.convert("RGB")`) even though IU X-Ray images are grayscale — this replicates the single channel across 3 channels for compatibility with ResNet101 pretrained on ImageNet.
+**Not used**: horizontal flip (left/right heart is diagnostic), vertical flip, large rotation.
+
+Val/test split uses deterministic `Resize(224) + ToTensor + Normalize` only.
 
 ### Report Cleaning (`clean_report`)
 

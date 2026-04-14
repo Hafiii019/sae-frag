@@ -11,7 +11,7 @@ This is the foundation that all subsequent stages depend on.
 ## Script
 
 ```bash
-python train.py
+python scripts/train/train_stage1.py
 ```
 
 Config is in `configs/config.py`:
@@ -44,10 +44,10 @@ View 1: (B, 3, 224, 224)
     P2(256), P3(256), P4(256), P5(256)
          │
     SAFE (Spatial Attention Feature Enhancement)
-    MHA(Q=C5_proj, K=P5, V=P5) + residual
-    → enhanced_1: (B, 256, 7, 7)
+    MHA(Q=C5_proj, K=P3, V=P3) + residual
+    → enhanced_1: (B, 256, 28, 28)
 
-View 2: same path → enhanced_2: (B, 256, 7, 7)
+View 2: same path → enhanced_2: (B, 256, 28, 28)
 
 fused = (enhanced_1 + enhanced_2) / 2   → (B, 256, 7, 7)
 ```

@@ -39,6 +39,26 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 
+_FPN_KEY_REMAP = {
+    "fpn.output_c2": "fpn.output_p2",
+    "fpn.output_c3": "fpn.output_p3",
+    "fpn.output_c4": "fpn.output_p4",
+    "fpn.output_c5": "fpn.output_p5",
+}
+
+
+def _remap_fpn_keys(state_dict: dict) -> dict:
+    """Translate legacy output_c* keys to output_p* when needed."""
+    new_sd = {}
+    for k, v in state_dict.items():
+        for old, new in _FPN_KEY_REMAP.items():
+            if k.startswith(old):
+                k = new + k[len(old):]
+                break
+        new_sd[k] = v
+    return new_sd
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -89,7 +109,7 @@ def main() -> None:
     log.info(f"Stage-1 : {os.path.relpath(ckpt_path, _ROOT)}")
 
     visual_encoder = MultiViewBackbone().to(device)
-    visual_encoder.load_state_dict(checkpoint["visual_model"])
+    visual_encoder.load_state_dict(_remap_fpn_keys(checkpoint["visual_model"]))
     visual_encoder.eval()
 
     alignment = CrossModalAlignment().to(device)

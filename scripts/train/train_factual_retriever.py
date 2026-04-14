@@ -53,6 +53,26 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 
+_FPN_KEY_REMAP = {
+    "fpn.output_c2": "fpn.output_p2",
+    "fpn.output_c3": "fpn.output_p3",
+    "fpn.output_c4": "fpn.output_p4",
+    "fpn.output_c5": "fpn.output_p5",
+}
+
+
+def _remap_fpn_keys(state_dict: dict) -> dict:
+    """Translate legacy output_c* keys to output_p* when needed."""
+    new_sd = {}
+    for k, v in state_dict.items():
+        for old, new in _FPN_KEY_REMAP.items():
+            if k.startswith(old):
+                k = new + k[len(old):]
+                break
+        new_sd[k] = v
+    return new_sd
+
+
 # =============================================================================
 # Dataset
 # =============================================================================
@@ -143,6 +163,8 @@ def main() -> None:
 
     # ── Config ────────────────────────────────────────────────────────────
     DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    USE_AMP      = DEVICE.type == "cuda"
+    log.info(f"Using device: {DEVICE} | AMP: {USE_AMP}")
     NUM_EPOCHS   = 15
     BATCH_SIZE   = 16
     ACCUM_STEPS  = 2
@@ -177,14 +199,14 @@ def main() -> None:
     train_ds   = FactualPairDataset(train_base, factual_pairs)
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=0, collate_fn=_collate, drop_last=True,
+        num_workers=0, collate_fn=_collate, drop_last=True, pin_memory=USE_AMP,
     )
     log.info(f"Training pairs: {len(train_ds)} | Batch: {BATCH_SIZE}")
 
     # ── Models ────────────────────────────────────────────────────────────
     ckpt           = torch.load(STAGE1_CKPT, map_location=DEVICE, weights_only=False)
     visual_encoder = MultiViewBackbone().to(DEVICE)
-    visual_encoder.load_state_dict(ckpt["visual_model"])
+    visual_encoder.load_state_dict(_remap_fpn_keys(ckpt["visual_model"]))
 
     alignment = CrossModalAlignment().to(DEVICE)
     alignment.load_state_dict(ckpt["alignment"])
@@ -216,6 +238,8 @@ def main() -> None:
         lr=LR, betas=(0.9, 0.98), eps=1e-6,
     )
 
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+
     total_steps  = len(train_loader) // ACCUM_STEPS * NUM_EPOCHS
     warmup_steps = int(WARMUP_RATIO * total_steps)
     scheduler    = get_cosine_schedule_with_warmup(
@@ -229,12 +253,14 @@ def main() -> None:
 
     if args.resume and os.path.exists(RESUME_FILE):
         state = torch.load(RESUME_FILE, map_location=DEVICE, weights_only=False)
-        visual_encoder.load_state_dict(state["visual_model"])
+        visual_encoder.load_state_dict(_remap_fpn_keys(state["visual_model"]))
         alignment.load_state_dict(state["alignment"])
         proj_img.load_state_dict(state["proj_img"])
         proj_doc.load_state_dict(state["proj_doc"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
+        if "scaler" in state:
+            scaler.load_state_dict(state["scaler"])
         start_epoch = state["epoch"] + 1
         best_loss   = state["best_loss"]
         no_improve  = state.get("no_improve", 0)
@@ -257,16 +283,21 @@ def main() -> None:
             q_imgs = q_imgs.to(DEVICE)
             d_imgs = d_imgs.to(DEVICE)
 
-            q_emb = _encode_query(visual_encoder, proj_img, q_imgs)
-            d_emb = _encode_document(visual_encoder, alignment, proj_doc, d_imgs, d_texts)
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP, dtype=torch.bfloat16):
+                q_emb = _encode_query(visual_encoder, proj_img, q_imgs)
+                d_emb = _encode_document(visual_encoder, alignment, proj_doc, d_imgs, d_texts)
+                loss = _info_nce_loss(q_emb, d_emb, TEMPERATURE) / ACCUM_STEPS
 
-            loss = _info_nce_loss(q_emb, d_emb, TEMPERATURE) / ACCUM_STEPS
-            loss.backward()
+            scaler.scale(loss).backward()
             epoch_loss += loss.item() * ACCUM_STEPS
 
             if (step + 1) % ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
-                optimizer.step(); scheduler.step(); optimizer.zero_grad()
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
 
             pbar.set_postfix(loss=f"{epoch_loss / (step + 1):.4f}")
 
@@ -297,6 +328,7 @@ def main() -> None:
             "proj_doc":     proj_doc.state_dict(),
             "optimizer":    optimizer.state_dict(),
             "scheduler":    scheduler.state_dict(),
+            "scaler":       scaler.state_dict(),
             "epoch":        epoch,
             "best_loss":    best_loss,
             "no_improve":   no_improve,

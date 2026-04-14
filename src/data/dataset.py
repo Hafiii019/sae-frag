@@ -9,12 +9,23 @@ import torchvision.transforms as transforms
 
 
 def _clean_report(text: str) -> str:
-    """Normalise raw IU X-Ray report text."""
+    """Normalise raw IU X-Ray report text.
+
+    Caps at 60 words as specified in SAENet (Cao et al. 2025) Section 4.1:
+    "The text length of each report is limited to 60 words."
+    This aligns train targets with the paper and prevents the generator from
+    learning to produce overly long outputs that T5 cannot decode efficiently.
+    """
     text = text.lower().strip()
     text = re.sub(r'\bxxxx\b', '', text)       # remove placeholders
     text = re.sub(r'\s+', ' ', text)            # collapse whitespace
     text = re.sub(r'[^\w\s.,;:\-]', '', text)  # strip junk chars
-    return text.strip()
+    text = text.strip()
+    # Limit to 60 words — matches SAENet paper dataset setting
+    words = text.split()
+    if len(words) > 60:
+        text = " ".join(words[:60])
+    return text
 
 
 class IUXrayMultiViewDataset(Dataset):
