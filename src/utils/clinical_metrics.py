@@ -94,7 +94,9 @@ class ClinicalMetrics:
         ref_entities = self._extract_entity_set(reference)
 
         if not ref_entities and not gen_entities:
-            p, r, f = 1.0, 1.0, 1.0
+            # Both empty: skip this sample entirely (don't count as 1.0)
+            # — common for normal-finding reports where no entities are found
+            return
         elif not gen_entities or not ref_entities:
             p, r, f = 0.0, 0.0, 0.0
         else:

@@ -115,55 +115,84 @@ class HybridReportGenerator(nn.Module):
 
     def forward(
         self,
-        region_features,     # (B, N, 256)  — spatial visual tokens from cache
-        entity_vector,       # (B, 14)
-        retrieved_texts,     # list[str]
-        prompt_texts,        # list[str]
-        target_texts=None
+        region_features,          # (B, N, 256)  — spatial visual tokens from cache
+        entity_vector,            # (B, 14)       — CheXbert soft-AND labels (kept for compat)
+        retrieved_texts,          # list[str]     — FAISS retrieved report text
+        prompt_texts,             # list[str]     — task instruction
+        target_texts=None,        # list[str]|None — generation targets (train only)
+        impression_texts=None,    # list[str]|None — impression section (auxiliary knowledge)
+        entity_texts=None,        # list[str]|None — Stanza entity tags text
     ):
+        """Encode all modalities and generate / compute loss.
 
+        Encoder input layout (PKARG-inspired):
+          [visual (49)] [entity_text (≤30)] [impression (≤25)] [retrieved (≤64)] [prompt (≤15)]
+          ≈ 49+30+25+64+15 = 183 tokens — comfortably under T5's 512-position cap.
+
+        When impression_texts / entity_texts are absent the old layout is preserved:
+          [visual (49)] [entity_proj (4)] [retrieved (128)] [prompt (≤25)] ≈ 206
+        """
         device = region_features.device
         B = region_features.size(0)
 
         # ── 0. Pool visual tokens to 49 (7×7) ────────────────────────────────
-        # T5's positional embedding hard-caps at 512.  Budget breakdown:
-        #   49 visual + 4 entity + 128 retrieved + ~25 prompt ≈ 206 tokens
-        # Works with any input N (e.g. 196=14×14 from old cache, 784=28×28 new)
         N = region_features.size(1)
         H = int(N ** 0.5)
         region_features = (
             region_features.view(B, H, H, 256)
-            .permute(0, 3, 1, 2)                         # (B, 256, H, H)
+            .permute(0, 3, 1, 2)
         )
-        region_features = F.adaptive_avg_pool2d(region_features, (7, 7))  # (B, 256, 7, 7)
+        region_features = F.adaptive_avg_pool2d(region_features, (7, 7))
         region_features = region_features.flatten(2).transpose(1, 2)      # (B, 49, 256)
 
-        # ── 1. Visual tokens: LayerNorm → Linear → Dropout ───────────────────
-        region_normed = self.visual_norm(region_features)           # (B, 49, 256)
-        visual_tokens = self.visual_drop(
-            self.visual_proj(region_normed)
-        )                                                           # (B, 49, d_model)
-        visual_mask = torch.ones(B, visual_tokens.size(1), device=device)
+        # ── 1. Visual tokens ──────────────────────────────────────────────────
+        region_normed = self.visual_norm(region_features)
+        visual_tokens = self.visual_drop(self.visual_proj(region_normed))  # (B, 49, d)
+        visual_mask   = torch.ones(B, visual_tokens.size(1), device=device)
 
-        # ── 2. Entity tokens: 2-layer MLP → N_ENTITY_TOKENS dense tokens ─────
-        entity_tokens = self.entity_proj(entity_vector.float()).view(
-            B, self.n_entity_tokens, -1
-        )                                                           # (B, 4, d_model)
-        entity_mask = torch.ones(B, self.n_entity_tokens, device=device)
+        # ── 2. Entity conditioning ────────────────────────────────────────────
+        # Priority: Stanza entity text (rich) > CheXbert binary (fallback)
+        if entity_texts is not None and any(t.strip() for t in entity_texts):
+            # Stanza entity text → T5 tokenizer (up to 30 tokens)
+            ent_enc = self.tokenizer(
+                entity_texts, return_tensors="pt", padding=True,
+                truncation=True, max_length=30,
+            ).to(device)
+            entity_tokens = self.t5.encoder.embed_tokens(ent_enc.input_ids)
+            entity_mask   = ent_enc.attention_mask
+        else:
+            # Legacy: 14-dim binary → 4 dense tokens via MLP
+            entity_tokens = self.entity_proj(entity_vector.float()).view(
+                B, self.n_entity_tokens, -1
+            )
+            entity_mask = torch.ones(B, self.n_entity_tokens, device=device)
 
-        # ── 3. Retrieved text tokens ──────────────────────────────────────────
-        # Capped at 128 tokens: keeps total sequence < 206, well within T5's 512
+        # ── 3. Impression tokens (PKARG auxiliary knowledge) ──────────────────
+        if impression_texts is not None and any(t.strip() for t in impression_texts):
+            imp_enc = self.tokenizer(
+                impression_texts, return_tensors="pt", padding=True,
+                truncation=True, max_length=25,
+            ).to(device)
+            impression_token_embs = self.t5.encoder.embed_tokens(imp_enc.input_ids)
+            impression_mask       = imp_enc.attention_mask
+            has_impression = True
+        else:
+            has_impression = False
+
+        # ── 4. Retrieved text tokens ──────────────────────────────────────────
+        # Budget: 64 tokens when impression present, else 128 (old behaviour)
+        ret_max_len = 64 if has_impression else 128
         retrieved_enc = self.tokenizer(
             retrieved_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=128,
+            max_length=ret_max_len,
         ).to(device)
         retrieved_embeds = self.t5.encoder.embed_tokens(retrieved_enc.input_ids)
         retrieved_mask   = retrieved_enc.attention_mask
 
-        # ── 4. Prompt tokens ──────────────────────────────────────────────────
+        # ── 5. Prompt tokens ──────────────────────────────────────────────────
         prompt_enc = self.tokenizer(
             prompt_texts,
             return_tensors="pt",
@@ -173,13 +202,25 @@ class HybridReportGenerator(nn.Module):
         prompt_embeds = self.t5.encoder.embed_tokens(prompt_enc.input_ids)
         prompt_mask   = prompt_enc.attention_mask
 
-        # ── 5. Concatenate: visual | entity | retrieved | prompt ──────────────
-        encoder_inputs = torch.cat(
-            [visual_tokens, entity_tokens, retrieved_embeds, prompt_embeds], dim=1
-        )
-        attention_mask = torch.cat(
-            [visual_mask, entity_mask, retrieved_mask, prompt_mask], dim=1
-        )
+        # ── 6. Concatenate all modalities ─────────────────────────────────────
+        # PKARG-inspired layout:
+        #   [visual | entity | impression | retrieved | prompt]
+        if has_impression:
+            encoder_inputs = torch.cat(
+                [visual_tokens, entity_tokens, impression_token_embs,
+                 retrieved_embeds, prompt_embeds], dim=1
+            )
+            attention_mask = torch.cat(
+                [visual_mask, entity_mask, impression_mask,
+                 retrieved_mask, prompt_mask], dim=1
+            )
+        else:
+            encoder_inputs = torch.cat(
+                [visual_tokens, entity_tokens, retrieved_embeds, prompt_embeds], dim=1
+            )
+            attention_mask = torch.cat(
+                [visual_mask, entity_mask, retrieved_mask, prompt_mask], dim=1
+            )
 
         # ── 6. Training ───────────────────────────────────────────────────────
         if target_texts is not None:

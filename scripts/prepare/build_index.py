@@ -112,7 +112,7 @@ def main() -> None:
     metadata:   list = []
 
     with torch.no_grad():
-        for images, reports in tqdm(loader, desc="Encoding"):
+        for images, reports, *_ in tqdm(loader, desc="Encoding"):
             images = images.to(device)
             feats  = visual_encoder(images)              # (1, 256, 14, 14)
 

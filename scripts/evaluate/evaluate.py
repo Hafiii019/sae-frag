@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import pickle
+import re
 import sys
 from collections import Counter
 
@@ -54,8 +55,34 @@ from utils.clinical_metrics import ClinicalMetrics
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
-nltk.download("wordnet", quiet=True)
-nltk.download("omw-1.4", quiet=True)
+nltk.download("wordnet",    quiet=True)
+nltk.download("omw-1.4",   quiet=True)
+nltk.download("punkt",     quiet=True)
+nltk.download("punkt_tab", quiet=True)
+
+
+def _normalize(text: str) -> str:
+    """Lowercase + strip punctuation attached to tokens, matching _clean_report().
+
+    Applied to the *generated* text before metric computation so it is
+    tokenized identically to the reference (which goes through _clean_report
+    at dataset load time: lowercase, xxxx removed, junk chars stripped).
+    """
+    text = text.lower().strip()
+    text = re.sub(r'\bxxxx\b', '', text)
+    text = re.sub(r'[^\w\s.,;:\-]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _tokenize(text: str) -> list:
+    """Tokenize text using NLTK word_tokenize (handles punctuation correctly).
+
+    e.g. 'normal.' → ['normal', '.'] not ['normal.']
+         'well-defined' → ['well-defined'] (hyphen kept)
+    """
+    from nltk.tokenize import word_tokenize
+    return word_tokenize(text)
 
 
 # =============================================================================
@@ -286,13 +313,15 @@ def main() -> None:
 
     # ── Evaluation loop ───────────────────────────────────────────────────
     with torch.no_grad():
-        for sample_idx, (images, reports) in enumerate(
+        for sample_idx, (images, reports, impressions, entity_texts) in enumerate(
             tqdm(test_loader, desc="Evaluating", unit="sample")
         ):
-            images    = images.to(device)
-            reference = reports[0]
+            images     = images.to(device)
+            reference  = reports[0]
+            impression = impressions[0]
+            entity_txt = entity_texts[0]
 
-            # Visual features: (1, 256, 14, 14) — 196 spatial tokens at P4
+            # Visual features
             visual_features = visual_encoder(images)
 
             # FAISS retrieval — top-5 candidates
@@ -314,54 +343,66 @@ def main() -> None:
             context = " [SEP] ".join([retrieved_report] + others)
             rag_context = HybridReportGenerator.build_rag_retrieved_text([context])[0]
 
-            # Region-aligned features: image regions attend to retrieved report
-            # Output: (1, 196, 256)
+            # Region-aligned features
             aligned_features, _, _ = alignment(visual_features, [retrieved_report])
 
-            # Soft-AND entity verification (image x text classifiers)
+            # Soft-AND entity verification
             img_entities  = torch.sigmoid(image_classifier(images))
             rep_entities  = torch.sigmoid(report_classifier([retrieved_report]))
             verified_ents = img_entities * rep_entities
 
-            # Generate report
-            prompt    = HybridReportGenerator.build_entity_prompt(verified_ents.cpu())
+            # Generate report — pass impression + Stanza entity text if available
+            prompt = HybridReportGenerator.build_entity_prompt(verified_ents.cpu())
             generated = generator(
                 region_features=aligned_features,
                 entity_vector=verified_ents,
                 retrieved_texts=[rag_context],
                 prompt_texts=prompt,
                 target_texts=None,
+                impression_texts=[impression] if impression.strip() else None,
+                entity_texts=[entity_txt] if entity_txt.strip() else None,
             )[0]
 
-            # Accumulate NLG metrics
-            ref_tokens = reference.split()
-            gen_tokens = generated.split()
+            # ── Normalize + tokenize for metric computation ────────────────────
+            # CRITICAL: reference is already lowercased by _clean_report().
+            # Generated text from SciFive is mixed-case — must normalize
+            # before metric computation or case mismatches kill BLEU scores.
+            generated_norm = _normalize(generated)
+            ref_tokens = _tokenize(reference)
+            gen_tokens = _tokenize(generated_norm)
 
             all_references.append([ref_tokens])
             all_hypotheses.append(gen_tokens)
             meteor_scores.append(meteor_score([ref_tokens], gen_tokens))
 
-            rouge_out = rouge_scorer_obj.score(reference, generated)
+            rouge_out = rouge_scorer_obj.score(reference, generated_norm)
             rouge1_scores.append(rouge_out["rouge1"].fmeasure)
             rouge2_scores.append(rouge_out["rouge2"].fmeasure)
             rougeL_scores.append(rouge_out["rougeL"].fmeasure)
 
-            clinical_metrics.update(reference, generated)
+            clinical_metrics.update(reference, generated_norm)
 
             generated_log.append({
-                "sample_idx":   sample_idx,
-                "uid":          str(test_dataset.samples[sample_idx]["uid"]),
-                "reference":    reference,
-                "generated":    generated,
-                "retrieved":    retrieved_report,
+                "sample_idx":    sample_idx,
+                "uid":           str(test_dataset.samples[sample_idx]["uid"]),
+                "reference":     reference,
+                "generated_raw": generated,
+                "generated":     generated_norm,
+                "retrieved":  retrieved_report,
                 "verify_score": round(float(verify_score), 4),
             })
 
     # ── Compute aggregate scores ──────────────────────────────────────────
-    bleu1 = corpus_bleu(all_references, all_hypotheses, weights=(1, 0, 0, 0))
-    bleu2 = corpus_bleu(all_references, all_hypotheses, weights=(0.5, 0.5, 0, 0))
-    bleu3 = corpus_bleu(all_references, all_hypotheses, weights=(1/3, 1/3, 1/3, 0))
-    bleu4 = corpus_bleu(all_references, all_hypotheses, weights=(0.25, 0.25, 0.25, 0.25))
+    # Corpus-level BLEU with add-1 smoothing (method1).
+    # Standard papers use no smoothing at corpus level, but many RRG papers
+    # (including R2Gen, PKARG) apply smoothing to handle zero n-gram counts
+    # in short medical reports.  Smoothing only affects BLEU-3/4 noticeably.
+    from nltk.translate.bleu_score import SmoothingFunction
+    smooth = SmoothingFunction().method1
+    bleu1 = corpus_bleu(all_references, all_hypotheses, weights=(1, 0, 0, 0),       smoothing_function=smooth)
+    bleu2 = corpus_bleu(all_references, all_hypotheses, weights=(0.5, 0.5, 0, 0),   smoothing_function=smooth)
+    bleu3 = corpus_bleu(all_references, all_hypotheses, weights=(1/3, 1/3, 1/3, 0), smoothing_function=smooth)
+    bleu4 = corpus_bleu(all_references, all_hypotheses, weights=(0.25,)*4,           smoothing_function=smooth)
     cider = _compute_cider(all_references, all_hypotheses)
 
     clinical_scores = clinical_metrics.compute()

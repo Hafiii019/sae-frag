@@ -164,7 +164,7 @@ def main() -> None:
         optimizer.zero_grad()
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS} [train]")
-        for step, (images, reports) in enumerate(loop):
+        for step, (images, reports, *_) in enumerate(loop):
             images = images.to(DEVICE)
 
             with autocast(device_type="cuda", enabled=USE_AMP, dtype=torch.bfloat16):

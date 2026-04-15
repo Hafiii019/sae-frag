@@ -143,7 +143,7 @@ def main() -> None:
         total_loss = 0.0
 
         loop = tqdm(loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}")
-        for images, reports in loop:
+        for images, reports, *_ in loop:
             images = images.to(DEVICE)
 
             with torch.no_grad():

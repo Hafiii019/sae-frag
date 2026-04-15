@@ -101,8 +101,8 @@ class FactualPairDataset(Dataset):
 
     def __getitem__(self, idx):
         q_idx, d_idx = self.pairs[idx]
-        q_img, _     = self.base[q_idx]
-        d_img, d_txt = self.base[d_idx]
+        q_img, *_    = self.base[q_idx]
+        d_img, d_txt = self.base[d_idx][:2]
         return q_img, d_img, d_txt
 
 

@@ -86,7 +86,7 @@ def _build_cache(
     cache   = []
 
     with torch.no_grad():
-        for images, reports in tqdm(loader, desc=f"Caching {split}"):
+        for images, reports, impressions, entity_texts in tqdm(loader, desc=f"Caching {split}"):
             images = images.to(device)
             B      = images.size(0)
 
@@ -123,13 +123,15 @@ def _build_cache(
                 cache.append({
                     "variants": [
                         {
-                            "aligned_features": per_rank[k][0][b],  # (196, 256)
+                            "aligned_features": per_rank[k][0][b],  # (49, 256)
                             "entity_vector":    per_rank[k][1][b],  # (14,)
                             "retrieved_text":   per_rank[k][2][b],
                         }
                         for k in range(k_variants)
                     ],
-                    "target": reports[b],
+                    "target":      reports[b],
+                    "impression":  impressions[b],   # auxiliary knowledge (impression section)
+                    "entity_tags": entity_texts[b],  # Stanza entity text (may be "")
                 })
 
     torch.save(cache, out_path)

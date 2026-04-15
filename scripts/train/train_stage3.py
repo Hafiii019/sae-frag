@@ -62,7 +62,9 @@ class CachedFeaturesDataset(Dataset):
         self.aligned  = [[v["aligned_features"] for v in item["variants"]] for item in data]
         self.entities = [[v["entity_vector"]    for v in item["variants"]] for item in data]
         self.reps     = [[v["retrieved_text"]   for v in item["variants"]] for item in data]
-        self.targets  = [item["target"] for item in data]
+        self.targets  = [item["target"]      for item in data]
+        self.impressions  = [item.get("impression",  "") for item in data]
+        self.entity_texts = [item.get("entity_tags", "") for item in data]
         log.info(f"  {len(self.targets)} samples loaded.")
 
     def __len__(self) -> int:
@@ -75,12 +77,14 @@ class CachedFeaturesDataset(Dataset):
             self.entities[idx][k],
             self.reps[idx][k],
             self.targets[idx],
+            self.impressions[idx],
+            self.entity_texts[idx],
         )
 
 
 def _collate(batch):
-    afs, evs, reps, targets = zip(*batch)
-    return torch.stack(afs), torch.stack(evs), list(reps), list(targets)
+    afs, evs, reps, targets, impressions, entity_texts = zip(*batch)
+    return torch.stack(afs), torch.stack(evs), list(reps), list(targets), list(impressions), list(entity_texts)
 
 
 # =============================================================================
@@ -223,7 +227,7 @@ def main() -> None:
         optimizer.zero_grad()
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}")
-        for step, (aligned_features, entity_vector, retrieved_texts, reports) in enumerate(loop):
+        for step, (aligned_features, entity_vector, retrieved_texts, reports, impressions, entity_texts) in enumerate(loop):
             aligned_features = aligned_features.to(DEVICE)
             entity_vector    = entity_vector.to(DEVICE)
 
@@ -237,6 +241,8 @@ def main() -> None:
                     retrieved_texts=rag_texts,
                     prompt_texts=prompts,
                     target_texts=reports,
+                    impression_texts=impressions,
+                    entity_texts=entity_texts,
                 ) / ACCUM_STEPS
 
             loss.backward()
@@ -264,7 +270,7 @@ def main() -> None:
         generator.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for val_af, val_ev, val_reps, val_reports in tqdm(
+            for val_af, val_ev, val_reps, val_reports, val_imps, val_etexts in tqdm(
                 val_loader, desc="  Val", leave=False
             ):
                 val_af = val_af.to(DEVICE)
@@ -276,6 +282,8 @@ def main() -> None:
                         retrieved_texts=HybridReportGenerator.build_rag_retrieved_text(list(val_reps)),
                         prompt_texts=HybridReportGenerator.build_entity_prompt(val_ev.cpu()),
                         target_texts=list(val_reports),
+                        impression_texts=list(val_imps),
+                        entity_texts=list(val_etexts),
                     ).item()
 
         avg_val = val_loss / max(len(val_loader), 1)

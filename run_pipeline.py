@@ -72,6 +72,12 @@ STAGES = [
         "store/factual_pairs.pkl",
     ),
     (
+        "extract_entities",
+        "Stanza Entity Extraction (PKARG auxiliary conditioning)",
+        "scripts/prepare/extract_entities.py --top_k 20",
+        "store/entity_tags.json",
+    ),
+    (
         "retriever",
         "Factual Retriever Training (FactMM-RAG)",
         "scripts/train/train_factual_retriever.py",
