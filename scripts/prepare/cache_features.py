@@ -110,7 +110,7 @@ def _build_cache(
                 # pre-pooling here halves cache size (~0.7 GB vs ~2.7 GB for P3)
                 # and eliminates per-step pooling overhead during stage-3 training.
                 Bs, Ns, Cs = af_k.shape
-                Hs = int(Ns ** 0.5)
+                Hs = int(Ns ** 0.6)
                 af_k_spatial = af_k.view(Bs, Hs, Hs, Cs).permute(0, 3, 1, 2)  # (B, 256, H, H)
                 af_k_pooled  = F.adaptive_avg_pool2d(af_k_spatial, (7, 7))     # (B, 256, 7, 7)
                 af_k_pooled  = af_k_pooled.flatten(2).transpose(1, 2)          # (B, 49, 256)
