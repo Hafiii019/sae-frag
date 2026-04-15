@@ -1,0 +1,208 @@
+╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+║                        SAE-FRAG: SPATIAL ATTENTION ENHANCED                                  ║
+║                    FACTUAL RETRIEVAL-AUGMENTED REPORT GENERATION                             ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+
+                             ┌─────────────────────────────┐
+                             │       IU X-RAY DATASET       │
+                             │  indiana_projections.csv     │
+                             │  indiana_reports.csv         │
+                             │  Frontal View (224×224)      │
+                             │  Lateral View (224×224)      │
+                             └──────────────┬──────────────┘
+                                            │
+                                            ▼
+                             ┌─────────────────────────────┐
+                             │      DATA PIPELINE           │
+                             │  IUXrayMultiViewDataset      │
+                             │  Input:  (B, 2, 3, 224, 224) │
+                             │  Target: cleaned report text │
+                             │  Split:  iu_split.csv        │
+                             └──────────────┬──────────────┘
+                                            │
+  ╔═════════════════════════════════════════╪═══════════════════════════════════════╗
+  ║  STAGE 1 — VISUAL-LANGUAGE ALIGNMENT   │                                       ║
+  ║  (Contrastive Pre-training)             │                                       ║
+  ╠═════════════════════════════════════════╪═══════════════════════════════════════╣
+  ║                                         ▼                                       ║
+  ║    ┌──────────────────────────────────────────────────────────────────────┐    ║
+  ║    │            MULTIVIEW BACKBONE  (shared weights, applied per view)    │    ║
+  ║    │                                                                      │    ║
+  ║    │  Frontal ──┐                         Lateral ──┐                    │    ║
+  ║    │             ▼                                    ▼                   │    ║
+  ║    │    ┌─────────────────┐              ┌─────────────────┐             │    ║
+  ║    │    │  ResNet-101      │              │  ResNet-101      │             │    ║
+  ║    │    │  (ImageNet-V2)  │              │  (ImageNet-V2)  │             │    ║
+  ║    │    │  C2: 256@56×56  │              │  C2: 256@56×56  │             │    ║
+  ║    │    │  C3: 512@28×28  │              │  C3: 512@28×28  │             │    ║
+  ║    │    │  C4:1024@14×14  │              │  C4:1024@14×14  │             │    ║
+  ║    │    │  C5:2048@ 7× 7  │              │  C5:2048@ 7× 7  │             │    ║
+  ║    │    └────────┬────────┘              └────────┬────────┘             │    ║
+  ║    │             ▼                                 ▼                      │    ║
+  ║    │    ┌─────────────────┐              ┌─────────────────┐             │    ║
+  ║    │    │  FPN             │              │  FPN             │             │    ║
+  ║    │    │  (Top-Down       │              │  (Top-Down       │             │    ║
+  ║    │    │  Lateral Conns)  │              │  Lateral Conns)  │             │    ║
+  ║    │    │  P2–P5 @ 256-ch  │              │  P2–P5 @ 256-ch  │             │    ║
+  ║    │    └────────┬────────┘              └────────┬────────┘             │    ║
+  ║    │             ▼                                 ▼                      │    ║
+  ║    │    ┌─────────────────┐              ┌─────────────────┐             │    ║
+  ║    │    │  SAFE            │              │  SAFE            │             │    ║
+  ║    │    │  C5 queries P3  │              │  C5 queries P3  │             │    ║
+  ║    │    │  MHA cross-attn │              │  MHA cross-attn │             │    ║
+  ║    │    │  (256@28×28)    │              │  (256@28×28)    │             │    ║
+  ║    │    └────────┬────────┘              └────────┬────────┘             │    ║
+  ║    │             └──────────────┬─────────────────┘                      │    ║
+  ║    │                            │  Element-wise Sum                       │    ║
+  ║    │                            ▼                                         │    ║
+  ║    │                   Fused: (B, 256, 28, 28)                            │    ║
+  ║    │                   Pool → (B, 49, 256)  [7×7 tokens]                 │    ║
+  ║    └────────────────────────────┬─────────────────────────────────────────┘   ║
+  ║                                 │                                              ║
+  ║    ┌────────────────────────────┴─────────────────────────────────────────┐   ║
+  ║    │              CROSS-MODAL ALIGNMENT                                    │   ║
+  ║    │                                                                       │   ║
+  ║    │   Image Regions (B,49,256) ──► ProjectionHead ──►  img_embed         │   ║
+  ║    │                                                         │             │   ║
+  ║    │   Report Text ──► Bio-ClinicalBERT ──► ProjectionHead ─► txt_embed   │   ║
+  ║    │                    (emilyalsentzer/                      │             │   ║
+  ║    │                     Bio_ClinicalBERT)               InfoNCE Loss      │   ║
+  ║    │                                                     (Contrastive)     │   ║
+  ║    └───────────────────────────────────────────────────────────────────────┘  ║
+  ║                                 │                                              ║
+  ║                     Save: checkpoints/stage1/best.pth                         ║
+  ╚═════════════════════════════════╪══════════════════════════════════════════════╝
+                                    │
+          ┌─────────────────────────┼──────────────────────────┐
+          │                         │                           │
+          ▼                         ▼                           ▼
+  ╔══════════════╗         ╔════════════════╗         ╔══════════════════════╗
+  ║  STAGE 2a    ║         ║   STAGE 2b     ║         ║  FACTUAL PAIR MINING ║
+  ║  REPORT      ║         ║   IMAGE        ║         ║  (FactMM-RAG eq.1)   ║
+  ║  CLASSIFIER  ║         ║   CLASSIFIER   ║         ║                      ║
+  ╠══════════════╣         ╠════════════════╣         ╠══════════════════════╣
+  ║              ║         ║                ║         ║  RadGraph NLP        ║
+  ║ Bio-Clinical ║  Distil ║  Frozen        ║         ║  entity extraction   ║
+  ║    BERT      ║  ──────►║  MultiView     ║         ║  Pair score:         ║
+  ║  + linear    ║  labels ║  Backbone      ║         ║  entity-F1 >= 0.3    ║
+  ║  14-class    ║         ║  + classifier  ║         ║  (not Jaccard)       ║
+  ║  CheXpert    ║         ║  head 14-class ║         ║                      ║
+  ║  pseudo-     ║         ║  BCE loss      ║         ║  Output:             ║
+  ║  labels      ║         ║                ║         ║  store/factual_      ║
+  ║              ║         ║  Save:         ║         ║  pairs.pkl           ║
+  ║  Save:       ║         ║  image_        ║         ║                      ║
+  ║  report_     ║         ║  classifier    ║         ║  + Stanza entity     ║
+  ║  classifier  ║         ║  .pth          ║         ║  tags (PKARG)        ║
+  ║  .pth        ║         ║                ║         ║  store/entity_       ║
+  ║              ║         ║                ║         ║  tags.json           ║
+  ╚══════════════╝         ╚════════════════╝         ╚══════════════════════╝
+          │                         │                           │
+          └─────────────────────────┴──────────────────────────┘
+                                    │
+          ╔═════════════════════════╪═══════════════════════════════════╗
+          ║  FACTUAL RETRIEVER TRAINING  (FactMM-RAG / InfoNCE)         ║
+          ╠═════════════════════════╪═══════════════════════════════════╣
+          ║                         ▼                                    ║
+          ║   Anchor Image (query) ──► MultiViewBackbone ──► proj_img   ║
+          ║                                                      │       ║
+          ║   Pos. Report (high F1) ──► Bio-ClinicalBERT ──► proj_doc  ║
+          ║   Neg. Reports (low F1)                              │       ║
+          ║                                              InfoNCE Loss    ║
+          ║                                                              ║
+          ║        Save: checkpoints/stage1/factual_retriever.pth       ║
+          ╚══════════════════════════════════════════════════════════════╝
+                                    │
+          ╔═════════════════════════╪═══════════════════════════════════╗
+          ║  FAISS INDEX BUILD                                           ║
+          ╠═════════════════════════╪═══════════════════════════════════╣
+          ║                         ▼                                    ║
+          ║   All train images ──► factual_retriever ──► embeddings     ║
+          ║                              FAISS IndexFlatIP               ║
+          ║                         store/faiss_index.bin               ║
+          ║                         store/train_reports.pkl             ║
+          ╚══════════════════════════════════════════════════════════════╝
+                                    │
+          ╔═════════════════════════╪═══════════════════════════════════╗
+          ║  FEATURE CACHE                                               ║
+          ╠═════════════════════════╪═══════════════════════════════════╣
+          ║                         ▼                                    ║
+          ║   Frozen MultiViewBackbone → visual tokens (B, 49, 256)     ║
+          ║   Frozen ImageClassifier  → entity logits (B, 14)           ║
+          ║        store/cache_train.pt  /  cache_val.pt                ║
+          ╚══════════════════════════════════════════════════════════════╝
+                                    │
+  ╔═════════════════════════════════╪═══════════════════════════════════════════╗
+  ║  STAGE 3 — HYBRID RAG REPORT GENERATOR                                      ║
+  ╠═════════════════════════════════╪═══════════════════════════════════════════╣
+  ║                                 ▼                                            ║
+  ║                                                                              ║
+  ║  ┌──────────────┐  ┌────────────────────┐  ┌──────────────────────────┐    ║
+  ║  │ Visual Tokens│  │  Entity Tokens      │  │  Retrieved Report        │    ║
+  ║  │ (B, 49, 256) │  │  (PKARG-style)      │  │  (FactMM-RAG RAG)        │    ║
+  ║  │ Cached from  │  │                     │  │                          │    ║
+  ║  │ frozen       │  │ Soft-AND:           │  │ FAISS top-1 search       │    ║
+  ║  │ MultiView    │  │  img_logits (x)     │  │  <= 128 tokens           │    ║
+  ║  │ Backbone     │  │  rep_logits         │  │                          │    ║
+  ║  │              │  │  -> 14-dim vector   │  │ Re-ranked by:            │    ║
+  ║  │ LayerNorm    │  │  -> 2-layer MLP     │  │ ReportVerifier           │    ║
+  ║  │ -> Linear    │  │  -> 4xd_model tokens│  │ (CrossModal cross-attn  │    ║
+  ║  │ -> d_model   │  │                     │  │  attention score)        │    ║
+  ║  └──────┬───────┘  └─────────┬───────────┘  └────────────┬────────────┘   ║
+  ║         │                    │                             │                 ║
+  ║         └────────────────────┴─────────────────────────── ┘                 ║
+  ║                                        │  Concatenate as encoder input       ║
+  ║                                        │  Total: <= 206 tokens              ║
+  ║                                        ▼                                     ║
+  ║                         ┌──────────────────────────┐                        ║
+  ║                         │   SciFive-base            │                        ║
+  ║                         │   (medically pre-trained  │                        ║
+  ║                         │    T5-base)               │                        ║
+  ║                         │                           │                        ║
+  ║                         │   Phase 1: Freeze T5,     │                        ║
+  ║                         │   train proj heads 3 ep.  │                        ║
+  ║                         │                           │                        ║
+  ║                         │   Phase 2: Full fine-tune │                        ║
+  ║                         │                           │                        ║
+  ║                         │   Inference:              │                        ║
+  ║                         │   beam search (n=3)       │                        ║
+  ║                         │   length_penalty=1.2      │                        ║
+  ║                         │   max 60 words output     │                        ║
+  ║                         └─────────────┬─────────────┘                       ║
+  ║                                       │                                      ║
+  ║                            Generated Radiology Report                        ║
+  ║                                                                              ║
+  ║                    Save: checkpoints/stage3/best_generator.pth               ║
+  ╚══════════════════════════════════════════════════════════════════════════════╝
+                                    │
+          ╔═════════════════════════╪═══════════════════════════════════╗
+          ║  EVALUATION                                                  ║
+          ╠═════════════════════════╪═══════════════════════════════════╣
+          ║                         ▼                                    ║
+          ║   NLG Metrics:  BLEU-1/2/3/4 · METEOR · ROUGE-L            ║
+          ║   Clinical:     CheXBert label F1                           ║
+          ║   Factual:      RadGraph Entity-F1                          ║
+          ║                                                              ║
+          ║   results/generated_reports.json                            ║
+          ║   results/metrics.json                                       ║
+          ╚══════════════════════════════════════════════════════════════╝
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                         MODEL & APPROACH LEGEND
+═══════════════════════════════════════════════════════════════════════════════
+
+  Visual Encoder    │ ResNet-101 (ImageNet-V2) + FPN + SAFE (MHA cross-attn)
+  View Fusion       │ SAENet eq.5 — per-view SAFE then element-wise sum
+  Text Encoder      │ Bio-ClinicalBERT (emilyalsentzer/Bio_ClinicalBERT)
+  Alignment Loss    │ InfoNCE contrastive (vision <-> language)
+  Classifier (text) │ Bio-ClinicalBERT + linear head, 14-class BCE
+  Classifier (img)  │ SAENet image backbone + linear head, knowledge distil.
+  Pair Mining       │ RadGraph entity-F1 >= 0.3 (FactMM-RAG eq.1)
+  Entity Tags       │ Stanza NLP, top-20 per report (PKARG conditioning)
+  Retrieval         │ FactMM-RAG dense retriever, FAISS IndexFlatIP, top-1
+  Verification      │ CrossModal cross-attention re-ranking (ReportVerifier)
+  Generator         │ SciFive-base / Flan-T5-base (T5-base architecture)
+  RAG Template      │ FactMM-RAG (NAACL 2025) prompt format
+  Entity Cond.      │ PKARG soft-AND (img x report) -> 4 MLP-projected tokens
+  Decoding          │ Beam search, n=3, length_penalty=1.2, <= 60 words
+  Dataset           │ IU X-Ray (Indiana University Chest X-Ray Collection)
