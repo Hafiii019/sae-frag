@@ -31,6 +31,10 @@
   "entity_precision": 0.7606,
   "entity_recall": 0.6488,
   "entity_f1": 0.69,
+  "fact_verify_precision": 0.8194,
+  "fact_verify_recall": 0.7618,
+  "fact_verify_f1": 0.7756,
+  "fact_verify_n_scored": 585,
   "num_test_samples": 771,
   "radgraph_mode": "radgraph"
 }

@@ -5,6 +5,7 @@ Metrics
 -------
 NLG     : BLEU-1/2/3/4, METEOR, ROUGE-1/2/L, CIDEr
 Clinical: CheXBert Label F1 (micro/macro/per-class), Entity F1
+Factual : Fact Verification Score (entity precision/recall/F1 vs reference)
 
 Outputs
 -------
@@ -50,6 +51,53 @@ from rag.hybrid_generator import HybridReportGenerator
 from rag.radgraph_extractor import RadGraphExtractor
 from rag.verifier import ReportVerifier
 from utils.clinical_metrics import ClinicalMetrics
+
+# ── Factual-verification helpers (from factual_verify.py) ─────────────────
+# Inline the clinical-entity vocabulary and scorers so evaluate.py stays
+# self-contained and runnable without a separate import step.
+import re as _re
+
+_CLINICAL_TERMS = sorted([
+    "pleural effusion", "pulmonary edema", "pulmonary fibrosis",
+    "pulmonary hypertension", "aortic dissection", "hilar adenopathy",
+    "mediastinal widening", "pneumoperitoneum", "pneumothorax",
+    "cardiomegaly", "atelectasis", "consolidation", "emphysema",
+    "infiltrate", "opacities", "opacity", "effusion", "granuloma",
+    "nodule", "mass", "hernia", "fibrosis", "scoliosis", "kyphosis",
+    "osteophyte", "fracture", "adenopathy", "calcification", "edema",
+    "pneumonia", "pacemaker", "defibrillator", "picc line", "catheter",
+    "spinal rods", "hyperexpanded", "hyperinflated",
+    "flattened diaphragm", "tortuous aorta", "atherosclerotic",
+    "normal heart size", "clear lungs", "no pneumothorax",
+    "no effusion", "no consolidation", "no pleural effusion",
+    "no focal consolidation", "bibasilar", "left lower lobe",
+    "right lower lobe", "left upper lobe", "right upper lobe",
+    "right middle lobe", "perihilar", "basilar",
+], key=lambda t: -len(t))
+
+
+def _fv_extract(text: str) -> set:
+    """Return clinical terms found in *text* (case-insensitive)."""
+    txt = text.lower()
+    return {
+        term for term in _CLINICAL_TERMS
+        if _re.search(r"\b" + _re.escape(term) + r"\b", txt)
+    }
+
+
+def _fv_scores(ref: str, gen: str):
+    """Return (precision, recall, f1) for entity overlap."""
+    ref_e = _fv_extract(ref)
+    gen_e = _fv_extract(gen)
+    if not ref_e and not gen_e:
+        return None, None, None          # skip trivially empty pairs
+    if not gen_e or not ref_e:
+        return 0.0, 0.0, 0.0
+    tp = len(gen_e & ref_e)
+    p  = tp / len(gen_e)
+    r  = tp / len(ref_e)
+    f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+    return p, r, f1
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -171,37 +219,47 @@ def _compute_cider(references: list, hypotheses: list) -> float:
 
 def _print_results(results: dict) -> None:
     """Print a formatted results summary."""
-    W = 55
-
-    def section(title, keys):
-        log.info(f"\n  {title}")
-        for k in keys:
-            if k in results:
-                log.info(f"    {k:<32} {results[k]}")
+    W = 62
 
     log.info("\n" + "=" * W)
-    log.info("  EVALUATION RESULTS")
+    log.info("  SAE-FRAG  ·  EVALUATION RESULTS")
     log.info("=" * W)
 
-    section(
-        "NLG Metrics",
-        ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4",
-         "METEOR", "ROUGE-1", "ROUGE-2", "ROUGE-L", "CIDEr"],
-    )
-    section(
-        "Retrieval Quality",
-        ["verify_score_mean", "verify_score_median"],
-    )
-    section(
-        "CheXBert Label F1",
-        ["chexbert_f1_micro", "chexbert_f1_macro",
-         "chexbert_precision_micro", "chexbert_recall_micro"],
-    )
-    section(
-        "Entity F1",
-        ["entity_precision", "entity_recall", "entity_f1"],
-    )
+    # ── Core thesis metrics table ─────────────────────────────────────────
+    log.info("\n  ┌─────────────────────────────────┬──────────┐")
+    log.info(  "  │ Metric                          │  Score   │")
+    log.info(  "  ├─────────────────────────────────┼──────────┤")
 
+    def row(label, key):
+        val = results.get(key, "N/A")
+        log.info(f"  │ {label:<31} │ {str(val):>8} │")
+
+    row("BLEU-1",                        "BLEU-1")
+    row("BLEU-2",                        "BLEU-2")
+    row("BLEU-3",                        "BLEU-3")
+    row("BLEU-4",                        "BLEU-4")
+    log.info("  ├─────────────────────────────────┼──────────┤")
+    row("ROUGE-L",                       "ROUGE-L")
+    row("METEOR",                        "METEOR")
+    row("CIDEr",                         "CIDEr")
+    log.info("  ├─────────────────────────────────┼──────────┤")
+    row("RadGraph Entity F1",            "entity_f1")
+    row("RadGraph Entity Precision",     "entity_precision")
+    row("RadGraph Entity Recall",        "entity_recall")
+    log.info("  ├─────────────────────────────────┼──────────┤")
+    row("CheXBert F1 (micro)",           "chexbert_f1_micro")
+    row("CheXBert F1 (macro)",           "chexbert_f1_macro")
+    row("CheXBert Precision (micro)",    "chexbert_precision_micro")
+    row("CheXBert Recall (micro)",       "chexbert_recall_micro")
+    log.info("  ├─────────────────────────────────┼──────────┤")
+    row("Fact Verification F1",          "fact_verify_f1")
+    row("Fact Verification Precision",   "fact_verify_precision")
+    row("Fact Verification Recall",      "fact_verify_recall")
+    log.info("  ├─────────────────────────────────┼──────────┤")
+    row("CrossModal Verify Score (mean)","verify_score_mean")
+    log.info("  └─────────────────────────────────┴──────────┘")
+
+    # ── Per-class CheXBert ────────────────────────────────────────────────
     log.info("\n  Per-class CheXBert F1:")
     for k, v in results.items():
         if k.startswith("chexbert_f1_") and k not in (
@@ -302,14 +360,17 @@ def main() -> None:
     )
 
     # ── Accumulators ─────────────────────────────────────────────────────
-    all_references: list = []
-    all_hypotheses: list = []
-    meteor_scores:  list = []
-    rouge1_scores:  list = []
-    rouge2_scores:  list = []
-    rougeL_scores:  list = []
-    verify_scores:  list = []
-    generated_log:  list = []
+    all_references:   list = []
+    all_hypotheses:   list = []
+    meteor_scores:    list = []
+    rouge1_scores:    list = []
+    rouge2_scores:    list = []
+    rougeL_scores:    list = []
+    verify_scores:    list = []
+    generated_log:    list = []
+    fv_p_list:        list = []   # fact-verify precision per sample
+    fv_r_list:        list = []   # fact-verify recall per sample
+    fv_f1_list:       list = []   # fact-verify F1 per sample
 
     # ── Evaluation loop ───────────────────────────────────────────────────
     with torch.no_grad():
@@ -382,6 +443,13 @@ def main() -> None:
 
             clinical_metrics.update(reference, generated_norm)
 
+            # ── Fact verification score ────────────────────────────────────
+            fv_p, fv_r, fv_f1 = _fv_scores(reference, generated_norm)
+            if fv_f1 is not None:           # skip trivially empty pairs
+                fv_p_list.append(fv_p)
+                fv_r_list.append(fv_r)
+                fv_f1_list.append(fv_f1)
+
             generated_log.append({
                 "sample_idx":    sample_idx,
                 "uid":           str(test_dataset.samples[sample_idx]["uid"]),
@@ -421,6 +489,10 @@ def main() -> None:
         "verify_score_mean":   round(float(np.mean(verify_scores)),   4),
         "verify_score_median": round(float(np.median(verify_scores)), 4),
         **clinical_scores,
+        "fact_verify_precision": round(float(np.mean(fv_p_list)),  4) if fv_p_list else None,
+        "fact_verify_recall":    round(float(np.mean(fv_r_list)),  4) if fv_r_list else None,
+        "fact_verify_f1":        round(float(np.mean(fv_f1_list)), 4) if fv_f1_list else None,
+        "fact_verify_n_scored":  len(fv_f1_list),
         "num_test_samples": len(all_hypotheses),
         "radgraph_mode":    "radgraph" if radgraph_extractor.using_radgraph else "keyword_fallback",
     }

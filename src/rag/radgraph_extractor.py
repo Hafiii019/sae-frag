@@ -251,8 +251,23 @@ class RadGraphExtractor:
 
     @property
     def using_radgraph(self) -> bool:
-        """``True`` when the real RadGraph model is loaded and active."""
-        return self._use_radgraph and self._model is not None
+        """``True`` when RadGraph is available (installed + not disabled).
+
+        The model is lazy-loaded on the first non-cached extract() call, so
+        ``_model is None`` simply means all results came from cache — NOT that
+        RadGraph is unavailable.  Check importability instead.
+        """
+        if not self._use_radgraph:
+            return False
+        # If the model is already loaded, definitely available
+        if self._model is not None:
+            return True
+        # Check importability without loading the full model weights
+        try:
+            import radgraph  # noqa: F401
+            return True
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Private helpers
