@@ -34,6 +34,7 @@ Stage 3 (FactMM-RAG) – Fact-Aware Retrieval + Hybrid Report Generator
 |---------------------------|--------|
 | BLEU-1                    | 0.6089 |
 | BLEU-2                    | 0.5410 |
+| BLEU-3                    | 0.4934 |
 | BLEU-4                    | 0.4567 |
 | METEOR                    | 0.5561 |
 | ROUGE-L                   | 0.5619 |
