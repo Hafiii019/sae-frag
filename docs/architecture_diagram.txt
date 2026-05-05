@@ -1,6 +1,6 @@
 ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
-║                        SAE-FRAG: SPATIAL ATTENTION ENHANCED                                  ║
-║                    FACTUAL RETRIEVAL-AUGMENTED REPORT GENERATION                             ║
+║                        RCM-FVR: Region-Aware Cross-Modal Alignment with Fact-Verified        ║
+║                            Retrieval-Augmented Radiology Report Generation                   ║
 ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
 
                              ┌─────────────────────────────┐
