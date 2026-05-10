@@ -44,9 +44,24 @@ import time
 ROOT = os.path.abspath(os.path.dirname(__file__))
 PYTHON = sys.executable
 
+# KMP_DUPLICATE_LIB_OK is also set inside each script before third-party imports,
+# but propagating it here is belt-and-suspenders for any script we may add later.
+_SUBPROCESS_ENV = os.environ.copy()
+_SUBPROCESS_ENV["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+
+def _build_cmd(script_path: str, extra: list) -> list:
+    return [PYTHON, script_path] + extra
+
 # ── Stage definitions ─────────────────────────────────────────────────────
 # Each stage: (id, human label, script path, skip-if-exists path or None)
 STAGES = [
+    (
+        "convert_models",
+        "Download Bio_ClinicalBERT safetensors (one-time setup)",
+        "scripts/prepare/convert_models.py",
+        "models/bio_clinical_bert/model.safetensors",
+    ),
     (
         "stage1",
         "Stage 1 — Visual-Language Alignment",
@@ -123,6 +138,9 @@ parser.add_argument("--force",  dest="force_stages", choices=STAGE_IDS, nargs="+
                     help="Force-run these stages even if checkpoint exists.")
 args = parser.parse_args()
 
+_SUBPROCESS_ENV = os.environ.copy()
+_SUBPROCESS_ENV["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
@@ -158,11 +176,11 @@ def run_stage(stage_id, label, script_args, skip_path, force=False):
             return True
 
     banner(label)
-    cmd = [PYTHON, os.path.join(ROOT, script)] + extra
+    cmd = _build_cmd(os.path.join(ROOT, script), extra)
     print(f"  Command: {' '.join(cmd)}\n")
 
     t0  = time.time()
-    ret = subprocess.run(cmd, cwd=ROOT)
+    ret = subprocess.run(cmd, cwd=ROOT, env=_SUBPROCESS_ENV)
     elapsed = time.time() - t0
 
     if ret.returncode != 0:

@@ -5,11 +5,11 @@ from models import MultiViewBackbone
 
 class SAEImageClassifier(nn.Module):
 
-    def __init__(self, num_classes=14):
+    def __init__(self, num_classes=14, no_safe: bool = False):
         super().__init__()
 
         # SAEnet backbone (ResNet101 + FPN + SAFE + multi-view fusion)
-        self.backbone = MultiViewBackbone()
+        self.backbone = MultiViewBackbone(no_safe=no_safe)
 
         # Global average and max pooling
         self.avgpool = nn.AdaptiveAvgPool2d(1)

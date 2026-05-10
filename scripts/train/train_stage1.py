@@ -46,6 +46,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoints/stage1/resume.pt")
+    parser.add_argument("--no_safe", action="store_true",
+                        help="Disable SAFE module — ablates spatial attention gain")
+    parser.add_argument("--exp_name", default=None,
+                        help="Ablation name; saves to checkpoints/ablations/<exp_name>/stage1/")
     args = parser.parse_args()
 
     # ── Config ────────────────────────────────────────────────────────────
@@ -58,12 +62,18 @@ def main() -> None:
     GRAD_CLIP    = 1.0
     USE_AMP      = DEVICE.type == "cuda"
 
-    CKPT_DIR    = os.path.join(_ROOT, "checkpoints", "stage1")
+    if args.exp_name:
+        CKPT_DIR = os.path.join(_ROOT, "checkpoints", "ablations", args.exp_name, "stage1")
+    else:
+        CKPT_DIR = os.path.join(_ROOT, "checkpoints", "stage1")
     BEST_CKPT   = os.path.join(CKPT_DIR, "best.pth")
     LATEST_CKPT = os.path.join(CKPT_DIR, "latest.pth")
     RESUME_FILE = os.path.join(CKPT_DIR, "resume.pt")
-    MIMIC_INIT  = os.path.join(CKPT_DIR, "mimic_pretrain.pth")
+    MIMIC_INIT  = os.path.join(_ROOT, "checkpoints", "stage1", "mimic_pretrain.pth")
     os.makedirs(CKPT_DIR, exist_ok=True)
+
+    if args.exp_name:
+        log.info(f"Ablation: {args.exp_name!r} | no_safe={args.no_safe}")
 
     log.info(f"Device : {DEVICE}  |  AMP: {USE_AMP}")
     log.info(f"Effective batch: {BATCH_SIZE} x {ACCUM_STEPS} = {BATCH_SIZE * ACCUM_STEPS}")
@@ -83,7 +93,7 @@ def main() -> None:
     log.info(f"Train: {len(train_dataset)} samples | Val: {len(val_dataset)} samples")
 
     # ── Models ────────────────────────────────────────────────────────────
-    visual_model = MultiViewBackbone().to(DEVICE)
+    visual_model = MultiViewBackbone(no_safe=args.no_safe).to(DEVICE)
     alignment    = CrossModalAlignment().to(DEVICE)
     proj_img     = ProjectionHead().to(DEVICE)
     proj_txt     = ProjectionHead().to(DEVICE)
@@ -203,7 +213,7 @@ def main() -> None:
 
         val_loss = 0.0
         with torch.no_grad():
-            for val_images, val_reports in tqdm(
+            for val_images, val_reports, *_ in tqdm(
                 val_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS} [val]", leave=False
             ):
                 val_images = val_images.to(DEVICE)

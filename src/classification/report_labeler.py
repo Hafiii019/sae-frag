@@ -1,6 +1,15 @@
+import os
+import sys
+
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
+
+# Use local safetensors copy when available (avoids transformers 5.x torch.load
+# safety check for old .bin models — see scripts/prepare/convert_models.py).
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
+from configs.config import BIO_CLINICAL_BERT
 
 
 class ReportClassifier(nn.Module):
@@ -8,13 +17,11 @@ class ReportClassifier(nn.Module):
     def __init__(self, num_classes=14):
         super().__init__()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "emilyalsentzer/Bio_ClinicalBERT"
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(BIO_CLINICAL_BERT)
 
         self.encoder = AutoModel.from_pretrained(
-            "emilyalsentzer/Bio_ClinicalBERT",
-            torch_dtype="auto"
+            BIO_CLINICAL_BERT,
+            torch_dtype="auto",
         )
 
         hidden_dim = 768

@@ -20,10 +20,13 @@ Usage
 import logging
 import os
 
+# Windows OMP fix: torch must load before faiss/scipy.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # ── Third-party ───────────────────────────────────────────────────────────
-import faiss
 import torch
 import torch.nn.functional as F
+import faiss
 
 # ── Project ───────────────────────────────────────────────────────────────
 from models import MultiViewBackbone, ProjectionHead

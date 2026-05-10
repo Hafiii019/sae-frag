@@ -27,11 +27,16 @@ import os
 import pickle
 import sys
 
+# Windows: faiss/scipy loads libiomp5md.dll; torch needs libomp.dll.
+# Set env var and import torch FIRST so torch claims the OMP slot.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # ── Third-party ───────────────────────────────────────────────────────────
-import faiss
-import numpy as np
+# torch must come before faiss (which pulls in scipy/libiomp5md.dll)
 import torch
 from torch.utils.data import DataLoader
+import faiss
+import numpy as np
 from tqdm import tqdm
 
 # ── Project ───────────────────────────────────────────────────────────────

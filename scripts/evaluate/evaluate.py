@@ -18,6 +18,7 @@ Usage
 """
 
 # ── Standard library ──────────────────────────────────────────────────────
+import argparse
 import json
 import logging
 import math
@@ -27,15 +28,23 @@ import re
 import sys
 from collections import Counter
 
+# Windows: scipy (loaded by nltk) ships libiomp5md.dll; torch ships libomp.dll.
+# If scipy loads first, OMP state is claimed and shm.dll fails (WinError 127).
+# Fix: set KMP_DUPLICATE_LIB_OK, then import torch *before* nltk/scipy so
+# torch claims the OMP slot first.  After that, scipy's libiomp5md.dll loads
+# as the duplicate and is silently tolerated.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # ── Third-party ───────────────────────────────────────────────────────────
+# torch must come before nltk (which pulls in scipy/libiomp5md.dll)
+import torch
+from torch.utils.data import DataLoader
 import faiss
 import nltk
 import numpy as np
-import torch
 from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # ── Project ───────────────────────────────────────────────────────────────
@@ -137,9 +146,23 @@ def _tokenize(text: str) -> list:
 # Helpers
 # =============================================================================
 
-def _load_checkpoint(device: torch.device) -> tuple:
-    """Return (state_dict, path) for the best available Stage-1 checkpoint."""
-    candidates = [
+def _load_checkpoint(
+    device: torch.device,
+    no_safe: bool = False,
+    exp_name: str | None = None,
+) -> tuple:
+    """Return (state_dict, path) for the best available Stage-1 checkpoint.
+
+    When no_safe is True, looks in checkpoints/ablations/no_safe/stage1/ first.
+    """
+    candidates = []
+    if no_safe and exp_name:
+        abl_s1 = os.path.join(_ROOT, "checkpoints", "ablations", exp_name, "stage1")
+        candidates += [
+            os.path.join(abl_s1, "factual_retriever.pth"),
+            os.path.join(abl_s1, "best.pth"),
+        ]
+    candidates += [
         os.path.join(_ROOT, "checkpoints", "stage1", "factual_retriever.pth"),
         os.path.join(_ROOT, "checkpoints", "stage1", "best.pth"),
     ]
@@ -151,24 +174,36 @@ def _load_checkpoint(device: torch.device) -> tuple:
     )
 
 
-# Must match MODEL_NAME in scripts/train/train_stage3.py
-_GENERATOR_MODEL = "razent/SciFive-base-Pubmed_PMC"
+def _load_generator(
+    device: torch.device,
+    model_name: str = "razent/SciFive-base-Pubmed_PMC",
+    exp_name: str | None = None,
+) -> torch.nn.Module:
+    """Load the fine-tuned report generator from the best available checkpoint.
 
-
-def _load_generator(device: torch.device) -> torch.nn.Module:
-    """Load the fine-tuned report generator from the best available checkpoint."""
-    candidates = [
+    If exp_name is set, first looks in checkpoints/ablations/<exp_name>/;
+    falls back to the standard stage3 directory if not found there.
+    """
+    candidates = []
+    if exp_name:
+        abl_dir = os.path.join(_ROOT, "checkpoints", "ablations", exp_name)
+        candidates += [
+            os.path.join(abl_dir, "best_generator.pth"),
+            os.path.join(abl_dir, "last_generator.pth"),
+        ]
+    candidates += [
         os.path.join(_ROOT, "checkpoints", "stage3", "best_generator.pth"),
         os.path.join(_ROOT, "checkpoints", "stage3", "last_generator.pth"),
     ]
     for path in candidates:
         if os.path.exists(path):
-            model = HybridReportGenerator(model_name=_GENERATOR_MODEL).to(device)
+            model = HybridReportGenerator(model_name=model_name).to(device)
             model.load_state_dict(
                 torch.load(path, map_location=device, weights_only=False),
                 strict=False,
             )
             model.eval()
+            log.info(f"Generator  : {os.path.relpath(path, _ROOT)}")
             return model
     raise FileNotFoundError(
         "No Stage-3 checkpoint found. Run: python scripts/train/train_stage3.py"
@@ -281,6 +316,34 @@ def _print_results(results: dict) -> None:
 # =============================================================================
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    # ── Ablation flags ────────────────────────────────────────────────────
+    parser.add_argument("--exp_name", default=None,
+                        help="Ablation name; loads from checkpoints/ablations/<exp> "
+                             "and writes to results/ablations/<exp>/")
+    parser.add_argument("--generator_model", default=None,
+                        help="Override T5 model (e.g. google/flan-t5-base)")
+    parser.add_argument("--num_beams", type=int, default=3,
+                        help="Beam width at inference (1=greedy)")
+    parser.add_argument("--length_penalty", type=float, default=1.2,
+                        help="T5 length penalty (1.0=neutral)")
+    parser.add_argument("--no_retrieval", action="store_true",
+                        help="Skip FAISS retrieval — ablates RAG contribution")
+    parser.add_argument("--no_entity", action="store_true",
+                        help="Zero entity vectors — ablates CheXbert conditioning")
+    parser.add_argument("--no_impression", action="store_true",
+                        help="Skip impression section — ablates auxiliary knowledge")
+    parser.add_argument("--no_safe", action="store_true",
+                        help="Load backbone without SAFE — ablates spatial attention gain")
+    parser.add_argument("--no_region_align", action="store_true",
+                        help="Skip CrossModalAlignment — ablates region-aware alignment gain")
+    args = parser.parse_args()
+
+    generator_model = args.generator_model or "razent/SciFive-base-Pubmed_PMC"
+
+    if args.exp_name:
+        log.info(f"Ablation   : {args.exp_name!r}")
+
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
 
@@ -307,10 +370,12 @@ def main() -> None:
     )
 
     # ── Models ────────────────────────────────────────────────────────────
-    checkpoint, ckpt_path = _load_checkpoint(device)
+    checkpoint, ckpt_path = _load_checkpoint(
+        device, no_safe=args.no_safe, exp_name=args.exp_name
+    )
     log.info(f"Checkpoint : {os.path.relpath(ckpt_path, _ROOT)}")
 
-    visual_encoder = MultiViewBackbone().to(device)
+    visual_encoder = MultiViewBackbone(no_safe=args.no_safe).to(device)
     visual_encoder.load_state_dict(checkpoint["visual_model"], strict=False)
     visual_encoder.eval()
 
@@ -322,12 +387,17 @@ def main() -> None:
     proj_img.load_state_dict(checkpoint["proj_img"])
     proj_img.eval()
 
-    image_classifier = SAEImageClassifier().to(device)
+    # When no_safe, load image_classifier from the ablation checkpoint dir.
+    if args.no_safe and args.exp_name:
+        _s2_ckpt = os.path.join(
+            _ROOT, "checkpoints", "ablations", args.exp_name, "stage2", "image_classifier.pth"
+        )
+    else:
+        _s2_ckpt = os.path.join(_ROOT, "checkpoints", "stage2", "image_classifier.pth")
+
+    image_classifier = SAEImageClassifier(no_safe=args.no_safe).to(device)
     image_classifier.load_state_dict(
-        torch.load(
-            os.path.join(_ROOT, "checkpoints", "stage2", "image_classifier.pth"),
-            map_location=device, weights_only=False,
-        ),
+        torch.load(_s2_ckpt, map_location=device, weights_only=False),
         strict=False,
     )
     image_classifier.eval()
@@ -341,7 +411,7 @@ def main() -> None:
     )
     report_classifier.eval()
 
-    generator = _load_generator(device)
+    generator = _load_generator(device, model_name=generator_model, exp_name=args.exp_name)
 
     verifier = ReportVerifier(alignment=alignment, min_score=0.0)
 
@@ -385,43 +455,64 @@ def main() -> None:
             # Visual features
             visual_features = visual_encoder(images)
 
-            # FAISS retrieval — top-5 candidates
-            global_feat = visual_features.flatten(2).mean(dim=2)
-            img_emb     = proj_img(global_feat)
-            img_np      = img_emb.cpu().float().numpy()
-            faiss.normalize_L2(img_np)
-            _, I = index.search(img_np, k=5)
+            # ── FAISS retrieval (skip when ablating RAG) ──────────────────
+            if args.no_retrieval:
+                retrieved_report = ""
+                verify_score     = 0.0
+                rag_context      = ""
+            else:
+                global_feat = visual_features.flatten(2).mean(dim=2)
+                img_emb     = proj_img(global_feat)
+                img_np      = img_emb.cpu().float().numpy()
+                faiss.normalize_L2(img_np)
+                _, I = index.search(img_np, k=5)
 
-            candidates = [train_metadata[int(i)]["report"] for i in I[0]]
+                candidates = [train_metadata[int(i)]["report"] for i in I[0]]
 
-            # Verifier — pick best candidate via cross-modal cosine score
-            retrieved_report, verify_score = verifier.verify(visual_features, candidates)
+                # Verifier — pick best candidate via cross-modal cosine score
+                retrieved_report, verify_score = verifier.verify(visual_features, candidates)
+
+                # Multi-retrieved context: verified best first + FAISS top-3
+                top3    = [train_metadata[int(i)]["report"] for i in I[0][:3]]
+                others  = [r for r in top3 if r != retrieved_report][:2]
+                context = " [SEP] ".join([retrieved_report] + others)
+                rag_context = HybridReportGenerator.build_rag_retrieved_text([context])[0]
+
             verify_scores.append(verify_score)
 
-            # Multi-retrieved context: verified best first + FAISS top-3
-            top3    = [train_metadata[int(i)]["report"] for i in I[0][:3]]
-            others  = [r for r in top3 if r != retrieved_report][:2]
-            context = " [SEP] ".join([retrieved_report] + others)
-            rag_context = HybridReportGenerator.build_rag_retrieved_text([context])[0]
-
             # Region-aligned features
-            aligned_features, _, _ = alignment(visual_features, [retrieved_report])
+            if args.no_region_align:
+                # Skip CrossModalAlignment — use raw spatial visual features.
+                # Reshape (B,256,H,W) -> (B, H*W, 256) to match expected format.
+                aligned_features = visual_features.flatten(2).transpose(1, 2)
+            else:
+                # Use empty string as text when no retrieval (no_retrieval ablation)
+                aligned_features, _, _ = alignment(visual_features, [retrieved_report])
 
-            # Soft-AND entity verification
-            img_entities  = torch.sigmoid(image_classifier(images))
-            rep_entities  = torch.sigmoid(report_classifier([retrieved_report]))
-            verified_ents = img_entities * rep_entities
+            # ── Entity verification (skip when ablating entity conditioning) ─
+            img_entities = torch.sigmoid(image_classifier(images))
+            if args.no_entity:
+                verified_ents = torch.zeros_like(img_entities)
+            else:
+                rep_entities  = torch.sigmoid(report_classifier([retrieved_report]))
+                verified_ents = img_entities * rep_entities
 
-            # Generate report — pass impression + Stanza entity text if available
+            # ── Generate report ───────────────────────────────────────────
             prompt = HybridReportGenerator.build_entity_prompt(verified_ents.cpu())
+            impression_arg = (
+                None if (args.no_impression or not impression.strip())
+                else [impression]
+            )
             generated = generator(
                 region_features=aligned_features,
                 entity_vector=verified_ents,
                 retrieved_texts=[rag_context],
                 prompt_texts=prompt,
                 target_texts=None,
-                impression_texts=[impression] if impression.strip() else None,
+                impression_texts=impression_arg,
                 entity_texts=[entity_txt] if entity_txt.strip() else None,
+                num_beams=args.num_beams,
+                length_penalty=args.length_penalty,
             )[0]
 
             # ── Normalize + tokenize for metric computation ────────────────────
@@ -495,12 +586,27 @@ def main() -> None:
         "fact_verify_n_scored":  len(fv_f1_list),
         "num_test_samples": len(all_hypotheses),
         "radgraph_mode":    "radgraph" if radgraph_extractor.using_radgraph else "keyword_fallback",
+        # ── Ablation metadata ─────────────────────────────────────────────
+        "ablation": {
+            "exp_name":        args.exp_name or "full_model",
+            "num_beams":       args.num_beams,
+            "length_penalty":  args.length_penalty,
+            "no_retrieval":    args.no_retrieval,
+            "no_entity":       args.no_entity,
+            "no_impression":   args.no_impression,
+            "no_safe":         args.no_safe,
+            "no_region_align": args.no_region_align,
+            "generator_model": generator_model,
+        },
     }
 
     _print_results(results)
 
     # ── Save outputs ──────────────────────────────────────────────────────
-    out_dir = os.path.join(_ROOT, "results")
+    if args.exp_name:
+        out_dir = os.path.join(_ROOT, "results", "ablations", args.exp_name)
+    else:
+        out_dir = os.path.join(_ROOT, "results")
     os.makedirs(out_dir, exist_ok=True)
 
     metrics_path = os.path.join(out_dir, "metrics.json")

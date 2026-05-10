@@ -5,7 +5,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, T5ForConditionalGeneration
+from transformers import AutoTokenizer, GenerationConfig, T5ForConditionalGeneration
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +122,8 @@ class HybridReportGenerator(nn.Module):
         target_texts=None,        # list[str]|None — generation targets (train only)
         impression_texts=None,    # list[str]|None — impression section (auxiliary knowledge)
         entity_texts=None,        # list[str]|None — Stanza entity tags text
+        num_beams: int = 3,       # beam width at inference (ablation: 1=greedy, 5=wide)
+        length_penalty: float = 1.2,  # >1 rewards longer outputs
     ):
         """Encode all modalities and generate / compute loss.
 
@@ -258,13 +260,20 @@ class HybridReportGenerator(nn.Module):
         # no_repeat_ngram_size=4: less aggressive than 3 — medical terms have
         #   legitimate 3-gram repeats (e.g. "no pleural effusion")
         # repetition_penalty removed: penalises legitimate anatomical repetition
+        # transformers 5.x moved early_stopping and length_penalty out of
+        # generate() kwargs and into GenerationConfig exclusively.
+        gen_cfg = GenerationConfig(
+            max_new_tokens=80,
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+            no_repeat_ngram_size=4,
+            eos_token_id=self.t5.config.eos_token_id,
+            pad_token_id=self.t5.config.pad_token_id,
+            decoder_start_token_id=self.t5.config.decoder_start_token_id,
+        )
         generated_ids = self.t5.generate(
             inputs_embeds=encoder_inputs,
             attention_mask=attention_mask,
-            max_new_tokens=80,
-            num_beams=3,
-            length_penalty=1.2,
-            no_repeat_ngram_size=4,
-            early_stopping=True,
+            generation_config=gen_cfg,
         )
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)

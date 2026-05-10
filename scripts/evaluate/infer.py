@@ -17,10 +17,13 @@ import os
 import pickle
 import sys
 
+# Windows OMP fix: torch must load before faiss/scipy.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # ── Third-party ───────────────────────────────────────────────────────────
-import faiss
 import torch
 import torch.nn.functional as F
+import faiss
 
 # ── Project ───────────────────────────────────────────────────────────────
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))

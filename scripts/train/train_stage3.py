@@ -95,6 +95,19 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoints/stage3/resume.pt")
+    # ── Ablation flags ────────────────────────────────────────────────────
+    parser.add_argument("--exp_name", default=None,
+                        help="Ablation name; saves to checkpoints/ablations/<exp_name>/")
+    parser.add_argument("--generator_model", default=None,
+                        help="Override the T5 model (e.g. google/flan-t5-base)")
+    parser.add_argument("--no_retrieval", action="store_true",
+                        help="Pass empty retrieved text — ablates RAG contribution")
+    parser.add_argument("--no_entity", action="store_true",
+                        help="Zero entity vectors — ablates CheXbert entity conditioning")
+    parser.add_argument("--no_impression", action="store_true",
+                        help="Skip impression section — ablates PKARG auxiliary knowledge")
+    parser.add_argument("--freeze_epochs", type=int, default=None,
+                        help="Override FREEZE_T5_EPOCHS (0 disables two-phase training)")
     args = parser.parse_args()
 
     # ── Config ────────────────────────────────────────────────────────────
@@ -107,7 +120,7 @@ def main() -> None:
     # SciFive-base is T5-base pre-trained on PubMed+PMC — same architecture but
     # medical vocabulary gives ~0.05 BLEU boost over flan-t5-base.
     # Fallback: change to "google/flan-t5-base" if download fails.
-    MODEL_NAME   = "razent/SciFive-base-Pubmed_PMC"
+    MODEL_NAME   = args.generator_model or "razent/SciFive-base-Pubmed_PMC"
     LR_T5        = 2e-5   # slightly higher: SciFive needs more domain adaptation
     LR_NEW       = 1e-4   # projections learn faster
     WEIGHT_DECAY = 0.01
@@ -115,15 +128,41 @@ def main() -> None:
     # Phase-1: train projection layers only (freeze T5) for N epochs so the
     # visual/entity projections align with the T5 embedding space before
     # the heavier T5 fine-tuning in phase-2.  Helps convergence on 6 GB GPU.
-    FREEZE_T5_EPOCHS = 3
+    FREEZE_T5_EPOCHS = args.freeze_epochs if args.freeze_epochs is not None else 3
 
-    STAGE3_DIR  = os.path.join(_ROOT, "checkpoints", "stage3")
+    if args.exp_name:
+        STAGE3_DIR = os.path.join(_ROOT, "checkpoints", "ablations", args.exp_name)
+    else:
+        STAGE3_DIR  = os.path.join(_ROOT, "checkpoints", "stage3")
     BEST_CKPT   = os.path.join(STAGE3_DIR, "best_generator.pth")
     LAST_CKPT   = os.path.join(STAGE3_DIR, "last_generator.pth")
     RESUME_FILE = os.path.join(STAGE3_DIR, "resume.pt")
-    TRAIN_CACHE = os.path.join(_ROOT, "store", "cache_train.pt")
-    VAL_CACHE   = os.path.join(_ROOT, "store", "cache_val.pt")
+
+    # Use ablation-specific cache when available; fall back to shared cache.
+    if args.exp_name:
+        _abl_store  = os.path.join(_ROOT, "store", "ablations", args.exp_name)
+        _abl_train  = os.path.join(_abl_store, "cache_train.pt")
+        _abl_val    = os.path.join(_abl_store, "cache_val.pt")
+        if os.path.exists(_abl_train):
+            TRAIN_CACHE = _abl_train
+            VAL_CACHE   = _abl_val
+            log.info(f"Using ablation cache: {os.path.relpath(_abl_store, _ROOT)}")
+        else:
+            TRAIN_CACHE = os.path.join(_ROOT, "store", "cache_train.pt")
+            VAL_CACHE   = os.path.join(_ROOT, "store", "cache_val.pt")
+            log.info("Ablation cache not found — using shared store/ cache.")
+    else:
+        TRAIN_CACHE = os.path.join(_ROOT, "store", "cache_train.pt")
+        VAL_CACHE   = os.path.join(_ROOT, "store", "cache_val.pt")
     os.makedirs(STAGE3_DIR, exist_ok=True)
+
+    if args.exp_name:
+        log.info(f"Ablation: {args.exp_name!r}")
+        if args.no_retrieval:  log.info("  --no_retrieval : RAG text zeroed out")
+        if args.no_entity:     log.info("  --no_entity    : entity vectors zeroed")
+        if args.no_impression: log.info("  --no_impression: impression section skipped")
+        if args.generator_model: log.info(f"  --generator_model: {MODEL_NAME}")
+        log.info(f"  FREEZE_T5_EPOCHS={FREEZE_T5_EPOCHS}")
 
     if not os.path.exists(TRAIN_CACHE):
         raise FileNotFoundError(
@@ -231,17 +270,26 @@ def main() -> None:
             aligned_features = aligned_features.to(DEVICE)
             entity_vector    = entity_vector.to(DEVICE)
 
-            prompts   = HybridReportGenerator.build_entity_prompt(entity_vector.cpu())
-            rag_texts = HybridReportGenerator.build_rag_retrieved_text(retrieved_texts)
+            # ── Ablation overrides ──────────────────────────────────────
+            entity_vector_in = (
+                torch.zeros_like(entity_vector) if args.no_entity else entity_vector
+            )
+            rag_texts = (
+                [""] * len(retrieved_texts) if args.no_retrieval
+                else HybridReportGenerator.build_rag_retrieved_text(retrieved_texts)
+            )
+            impression_in = None if args.no_impression else impressions
+
+            prompts = HybridReportGenerator.build_entity_prompt(entity_vector_in.cpu())
 
             with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP, dtype=torch.bfloat16):
                 loss = generator(
                     region_features=aligned_features,
-                    entity_vector=entity_vector,
+                    entity_vector=entity_vector_in,
                     retrieved_texts=rag_texts,
                     prompt_texts=prompts,
                     target_texts=reports,
-                    impression_texts=impressions,
+                    impression_texts=impression_in,
                     entity_texts=entity_texts,
                 ) / ACCUM_STEPS
 
@@ -275,14 +323,20 @@ def main() -> None:
             ):
                 val_af = val_af.to(DEVICE)
                 val_ev = val_ev.to(DEVICE)
+                val_ev_in = torch.zeros_like(val_ev) if args.no_entity else val_ev
+                val_rag = (
+                    [""] * val_af.size(0) if args.no_retrieval
+                    else HybridReportGenerator.build_rag_retrieved_text(list(val_reps))
+                )
+                val_imp = None if args.no_impression else list(val_imps)
                 with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP, dtype=torch.bfloat16):
                     val_loss += generator(
                         region_features=val_af,
-                        entity_vector=val_ev,
-                        retrieved_texts=HybridReportGenerator.build_rag_retrieved_text(list(val_reps)),
-                        prompt_texts=HybridReportGenerator.build_entity_prompt(val_ev.cpu()),
+                        entity_vector=val_ev_in,
+                        retrieved_texts=val_rag,
+                        prompt_texts=HybridReportGenerator.build_entity_prompt(val_ev_in.cpu()),
                         target_texts=list(val_reports),
-                        impression_texts=list(val_imps),
+                        impression_texts=val_imp,
                         entity_texts=list(val_etexts),
                     ).item()
 

@@ -50,6 +50,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoints/stage2/resume.pt")
+    parser.add_argument("--no_safe", action="store_true",
+                        help="Disable SAFE module — must match the stage1 ablation setting")
+    parser.add_argument("--exp_name", default=None,
+                        help="Ablation name; loads stage1 from and saves to "
+                             "checkpoints/ablations/<exp_name>/stage2/")
     args = parser.parse_args()
 
     # ── Config ────────────────────────────────────────────────────────────
@@ -61,11 +66,18 @@ def main() -> None:
     PATIENCE   = 5
     GRAD_CLIP  = 1.0
 
-    CKPT_DIR    = os.path.join(_ROOT, "checkpoints", "stage2")
+    if args.exp_name:
+        CKPT_DIR = os.path.join(_ROOT, "checkpoints", "ablations", args.exp_name, "stage2")
+        S1_CKPT  = os.path.join(_ROOT, "checkpoints", "ablations", args.exp_name, "stage1", "best.pth")
+    else:
+        CKPT_DIR = os.path.join(_ROOT, "checkpoints", "stage2")
+        S1_CKPT  = os.path.join(_ROOT, "checkpoints", "stage1", "best.pth")
     BEST_CKPT   = os.path.join(CKPT_DIR, "image_classifier.pth")
     RESUME_FILE = os.path.join(CKPT_DIR, "resume.pt")
-    S1_CKPT     = os.path.join(_ROOT, "checkpoints", "stage1", "best.pth")
     os.makedirs(CKPT_DIR, exist_ok=True)
+
+    if args.exp_name:
+        log.info(f"Ablation: {args.exp_name!r} | no_safe={args.no_safe}")
 
     log.info(f"Device: {DEVICE}  |  AMP: {USE_AMP}")
 
@@ -77,18 +89,16 @@ def main() -> None:
     )
     log.info(f"Train samples: {len(dataset)}")
 
-    # ── Report classifier (frozen teacher) ────────────────────────────────
+    # ── Report classifier (frozen teacher — always shared, never ablated) ─
+    _report_cls_path = os.path.join(_ROOT, "checkpoints", "stage2", "report_classifier.pth")
     report_classifier = ReportClassifier().to(DEVICE)
     report_classifier.load_state_dict(
-        torch.load(
-            os.path.join(CKPT_DIR, "report_classifier.pth"),
-            map_location=DEVICE, weights_only=False,
-        )
+        torch.load(_report_cls_path, map_location=DEVICE, weights_only=False)
     )
     report_classifier.eval()
 
     # ── Image classifier ──────────────────────────────────────────────────
-    image_classifier = SAEImageClassifier().to(DEVICE)
+    image_classifier = SAEImageClassifier(no_safe=args.no_safe).to(DEVICE)
 
     if os.path.exists(S1_CKPT):
         s1 = torch.load(S1_CKPT, map_location=DEVICE, weights_only=False)

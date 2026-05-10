@@ -15,11 +15,24 @@ ProjectionHead          MLP + L2-norm projection head (query/image-text encoder)
 DocumentProjectionHead  Same architecture, independent weights (doc encoder)
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
 from transformers import AutoModel, AutoTokenizer
+
+# Use local safetensors copy of Bio_ClinicalBERT when available to avoid the
+# transformers 5.x CVE-2025-32434 torch.load check on old .bin weights.
+# Run once: python scripts/prepare/convert_models.py
+_THIS_DIR   = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_BERT = os.path.normpath(os.path.join(_THIS_DIR, "..", "..", "models", "bio_clinical_bert"))
+_BIO_CLINICAL_BERT = (
+    _LOCAL_BERT
+    if os.path.exists(os.path.join(_LOCAL_BERT, "model.safetensors"))
+    else "emilyalsentzer/Bio_ClinicalBERT"
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -191,9 +204,9 @@ class CrossModalAlignment(nn.Module):
 
     def __init__(self, embed_dim: int = 256, num_heads: int = 8):
         super().__init__()
-        self.tokenizer    = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+        self.tokenizer    = AutoTokenizer.from_pretrained(_BIO_CLINICAL_BERT)
         self.text_encoder = AutoModel.from_pretrained(
-            "emilyalsentzer/Bio_ClinicalBERT", torch_dtype="auto"
+            _BIO_CLINICAL_BERT, torch_dtype="auto"
         )
         # Freeze BERT — only the projection and attention head are trained
         for param in self.text_encoder.parameters():
@@ -386,15 +399,23 @@ class MultiViewBackbone(nn.Module):
 
     Input  : (B, 2, 3, 224, 224)
     Output : (B, 256, 14, 14)  — 196 spatial tokens at P4 resolution
+
+    Parameters
+    ----------
+    no_safe : bool
+        Ablation flag — when True, SAFE is skipped and P4 is returned directly.
+        Dual-view fusion uses equal-weight averaging instead of learned weights.
     """
 
-    def __init__(self):
+    def __init__(self, no_safe: bool = False):
         super().__init__()
         self.backbone  = ResNet101Backbone(pretrained=True)
         self.fpn       = FPN(out_channels=256)
-        self.safe      = SAFE(embed_dim=256, num_heads=8)
-        # Learnable per-view fusion weights (softmax-normalised)
-        self.view_attn = nn.Parameter(torch.zeros(2))
+        self.no_safe   = no_safe
+        if not no_safe:
+            self.safe      = SAFE(embed_dim=256, num_heads=8)
+            # Learnable per-view fusion weights (softmax-normalised)
+            self.view_attn = nn.Parameter(torch.zeros(2))
 
     def forward(self, x):
         B, V, C, H, W = x.shape   # V == 2 always (frontal, lateral)
@@ -402,11 +423,15 @@ class MultiViewBackbone(nn.Module):
         def _encode(view):
             c2, c3, c4, c5 = self.backbone(view)
             _, _, p4, _    = self.fpn(c2, c3, c4, c5)
+            if self.no_safe:
+                return p4                              # (B, 256, 14, 14) — no attention
             return self.safe(c5, p4)                   # (B, 256, 14, 14)
 
         feat1 = _encode(x[:, 0])
         feat2 = _encode(x[:, 1])
 
+        if self.no_safe:
+            return (feat1 + feat2) * 0.5               # equal-weight average
         w = torch.softmax(self.view_attn, dim=0)       # (2,)
         return w[0] * feat1 + w[1] * feat2             # (B, 256, 14, 14)
 
@@ -435,9 +460,9 @@ class CrossModalAlignment(nn.Module):
 
     def __init__(self, embed_dim: int = 256, num_heads: int = 8):
         super().__init__()
-        self.tokenizer    = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+        self.tokenizer    = AutoTokenizer.from_pretrained(_BIO_CLINICAL_BERT)
         self.text_encoder = AutoModel.from_pretrained(
-            "emilyalsentzer/Bio_ClinicalBERT", torch_dtype="auto"
+            _BIO_CLINICAL_BERT, torch_dtype="auto"
         )
         # Freeze BERT — only the projection and attention head are trained
         for param in self.text_encoder.parameters():

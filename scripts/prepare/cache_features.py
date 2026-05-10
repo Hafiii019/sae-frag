@@ -7,25 +7,41 @@ inference is done here so the Stage-3 training loop only loads a generator.
 If checkpoints/stage1/factual_retriever.pth exists the cache is built with
 the FactMM-RAG-trained encoder for better retrieval quality.
 
-Outputs  ->  store/
+Outputs  ->  store/                               (default)
+         ->  store/ablations/<exp_name>/          (when --exp_name is set)
     cache_train.pt   2695 samples, each with 5 retrieval variants
     cache_val.pt     385 samples, each with 1 retrieval variant
+
+Ablation flags
+--------------
+  --no_safe          Load backbone without SAFE — must match stage1/stage2 ablation
+  --no_fact_rag      Force stage1/best.pth even if factual_retriever.pth exists
+  --no_region_align  Store raw visual features instead of alignment-enhanced features
 
 Usage
 -----
     python scripts/prepare/cache_features.py
+    python scripts/prepare/cache_features.py --no_fact_rag --exp_name no_fact_rag
+    python scripts/prepare/cache_features.py --no_region_align --exp_name no_region_align
+    python scripts/prepare/cache_features.py --no_safe --exp_name no_safe
 """
 
 # ── Standard library ──────────────────────────────────────────────────────
+import argparse
 import logging
 import os
 import pickle
 import sys
 
+# Windows: faiss/scipy loads libiomp5md.dll; torch needs libomp.dll.
+# Set env var and import torch FIRST so torch claims the OMP slot.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # ── Third-party ───────────────────────────────────────────────────────────
-import faiss
+# torch must come before faiss (which pulls in scipy/libiomp5md.dll)
 import torch
 import torch.nn.functional as F
+import faiss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -80,6 +96,7 @@ def _build_cache(
     index: faiss.Index,
     train_metadata: list,
     batch_size: int = 8,
+    no_region_align: bool = False,
 ) -> None:
     dataset = IUXrayMultiViewDataset(Config.DATA_ROOT, split=split)
     loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -102,18 +119,25 @@ def _build_cache(
 
             per_rank = []
             for k in range(k_variants):
-                reps_k     = [train_metadata[I[b][k]]['report'] for b in range(B)]
-                af_k, _, _ = alignment(visual_features, reps_k)        # (B, H*W, 256)
+                reps_k = [train_metadata[I[b][k]]['report'] for b in range(B)]
+
+                if no_region_align:
+                    # Skip cross-modal alignment — use raw visual features directly.
+                    # The generator still sees spatial structure; CrossModalAlignment
+                    # gain is measured by comparing this ablation to the full model.
+                    af_k_spatial = visual_features                     # (B, 256, 14, 14)
+                else:
+                    af_k, _, _ = alignment(visual_features, reps_k)   # (B, H*W, 256)
+                    Bs, Ns, Cs = af_k.shape
+                    Hs = int(Ns ** 0.5)
+                    af_k_spatial = af_k.view(Bs, Hs, Hs, Cs).permute(0, 3, 1, 2)  # (B, 256, H, H)
 
                 # Pool spatial tokens to 49 (7×7) for compact cache storage.
                 # This is backward-compatible: hybrid_generator pools anyway, so
                 # pre-pooling here halves cache size (~0.7 GB vs ~2.7 GB for P3)
                 # and eliminates per-step pooling overhead during stage-3 training.
-                Bs, Ns, Cs = af_k.shape
-                Hs = int(Ns ** 0.5)
-                af_k_spatial = af_k.view(Bs, Hs, Hs, Cs).permute(0, 3, 1, 2)  # (B, 256, H, H)
-                af_k_pooled  = F.adaptive_avg_pool2d(af_k_spatial, (7, 7))     # (B, 256, 7, 7)
-                af_k_pooled  = af_k_pooled.flatten(2).transpose(1, 2)          # (B, 49, 256)
+                af_k_pooled = F.adaptive_avg_pool2d(af_k_spatial, (7, 7))  # (B, 256, 7, 7)
+                af_k_pooled = af_k_pooled.flatten(2).transpose(1, 2)        # (B, 49, 256)
 
                 rep_ent_k  = torch.sigmoid(report_classifier(reps_k))  # (B, 14)
                 ev_k       = img_entities * rep_ent_k                  # (B, 14) soft-AND
@@ -143,22 +167,52 @@ def _build_cache(
 # =============================================================================
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no_safe", action="store_true",
+                        help="Load backbone without SAFE — must match stage1/stage2 ablation")
+    parser.add_argument("--no_fact_rag", action="store_true",
+                        help="Force stage1/best.pth even if factual_retriever.pth exists — "
+                             "ablates fact-verified retrieval gain")
+    parser.add_argument("--no_region_align", action="store_true",
+                        help="Store raw visual features instead of alignment-enhanced features — "
+                             "ablates CrossModalAlignment gain")
+    parser.add_argument("--exp_name", default=None,
+                        help="Ablation name; output cache goes to store/ablations/<exp_name>/")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    FACTUAL_CKPT = os.path.join(_ROOT, "checkpoints", "stage1", "factual_retriever.pth")
-    STAGE1_CKPT  = os.path.join(_ROOT, "checkpoints", "stage1", "best.pth")
-    use_factual  = os.path.exists(FACTUAL_CKPT)
+    # ── Determine which stage1/stage2 checkpoints to use ──────────────────
+    if args.no_safe and args.exp_name:
+        s1_dir = os.path.join(_ROOT, "checkpoints", "ablations", args.exp_name, "stage1")
+        s2_dir = os.path.join(_ROOT, "checkpoints", "ablations", args.exp_name, "stage2")
+    else:
+        s1_dir = os.path.join(_ROOT, "checkpoints", "stage1")
+        s2_dir = os.path.join(_ROOT, "checkpoints", "stage2")
 
-    if use_factual:
+    FACTUAL_CKPT = os.path.join(s1_dir, "factual_retriever.pth")
+    STAGE1_CKPT  = os.path.join(s1_dir, "best.pth")
+
+    if args.no_fact_rag:
+        log.info("no_fact_rag: forcing Stage-1 contrastive checkpoint (ignoring factual retriever).")
+        ckpt = torch.load(STAGE1_CKPT, map_location=device, weights_only=False)
+    elif os.path.exists(FACTUAL_CKPT):
         log.info("Using FactMM-RAG factual retriever checkpoint.")
         ckpt = torch.load(FACTUAL_CKPT, map_location=device, weights_only=False)
     else:
         log.info("Using Stage-1 checkpoint (factual retriever not found).")
         ckpt = torch.load(STAGE1_CKPT, map_location=device, weights_only=False)
 
+    if args.exp_name:
+        log.info(
+            f"Ablation: {args.exp_name!r} | "
+            f"no_safe={args.no_safe} | no_fact_rag={args.no_fact_rag} | "
+            f"no_region_align={args.no_region_align}"
+        )
+
     # ── Load frozen models ─────────────────────────────────────────────────
-    visual_encoder = MultiViewBackbone().to(device)
-    visual_encoder.load_state_dict(_remap_fpn_keys(ckpt["visual_model"]))
+    visual_encoder = MultiViewBackbone(no_safe=args.no_safe).to(device)
+    visual_encoder.load_state_dict(_remap_fpn_keys(ckpt["visual_model"]), strict=False)
     visual_encoder.eval()
 
     alignment = CrossModalAlignment().to(device)
@@ -169,10 +223,10 @@ def main() -> None:
     proj_img.load_state_dict(ckpt["proj_img"])
     proj_img.eval()
 
-    image_classifier = SAEImageClassifier().to(device)
+    image_classifier = SAEImageClassifier(no_safe=args.no_safe).to(device)
     image_classifier.load_state_dict(
         torch.load(
-            os.path.join(_ROOT, "checkpoints", "stage2", "image_classifier.pth"),
+            os.path.join(s2_dir, "image_classifier.pth"),
             map_location=device, weights_only=False,
         ),
         strict=False,
@@ -194,8 +248,15 @@ def main() -> None:
 
     log.info("All models loaded.\n")
 
+    # ── Output directory ───────────────────────────────────────────────────
+    if args.exp_name:
+        store = os.path.join(_ROOT, "store", "ablations", args.exp_name)
+        os.makedirs(store, exist_ok=True)
+        log.info(f"Cache output: {os.path.relpath(store, _ROOT)}")
+    else:
+        store = os.path.join(_ROOT, "store")
+
     # ── Build caches ───────────────────────────────────────────────────────
-    store = os.path.join(_ROOT, "store")
     kwargs = dict(
         device=device,
         visual_encoder=visual_encoder,
@@ -205,12 +266,16 @@ def main() -> None:
         report_classifier=report_classifier,
         index=index,
         train_metadata=train_metadata,
+        no_region_align=args.no_region_align,
     )
 
     _build_cache("train", os.path.join(store, "cache_train.pt"), k_variants=5, **kwargs)
     _build_cache("val",   os.path.join(store, "cache_val.pt"),   k_variants=1, **kwargs)
 
-    log.info("\nDone. Next: python scripts/train/train_stage3.py")
+    if args.exp_name:
+        log.info(f"\nDone. Next: python scripts/train/train_stage3.py --exp_name {args.exp_name}")
+    else:
+        log.info("\nDone. Next: python scripts/train/train_stage3.py")
 
 
 if __name__ == "__main__":

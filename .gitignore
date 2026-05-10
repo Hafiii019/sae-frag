@@ -8,7 +8,7 @@ env/
 sae_frag/
 .conda/
 
-# Dataset images and large files (keep on Drive, not GitHub)
+# Datasets and images (keep on Drive, not GitHub)
 Datasets/
 *.zip
 *.tar.gz
@@ -16,8 +16,10 @@ Datasets/
 *.png
 *.jpg
 
-# Large binary store files (too big for GitHub)
+# Model binaries and large data files — never commit these
 store/
+models/
+checkpoints/
 *.pt
 *.pth
 *.ckpt
@@ -25,14 +27,18 @@ store/
 *.bin
 *.pkl
 
-# Logs and outputs
+# Logs
 *.log
 train_output.txt
 eval_output.txt
 
-# VS Code / env
+# Editor / env
 .vscode/
 .env
 
-# Keep these CSVs (split definitions needed on Colab)
+# results/ is intentionally NOT ignored here.
+# Binary file-type rules above catch any accidental large files.
+# All JSON files in results/ and results/ablations/**/ are tracked.
+
+# Keep split CSV definitions
 !data/splits/iu_split.csv
